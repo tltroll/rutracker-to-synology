@@ -8,7 +8,7 @@ from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, 
     TelegramObject, Update, InlineQuery, InlineQueryResultPhoto, 
-    InlineQueryResultArticle, InputTextMessageContent
+    InlineQueryResultArticle, InputTextMessageContent, InputMediaPhoto
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -87,6 +87,10 @@ list_state_cache = {}
 # Кэш для хранения типа контента (movie/serial) по тексту запроса
 # (normalized_query -> type)
 content_type_cache = {}
+
+# Кэш для хранения ID кинопаба по тексту запроса
+# (normalized_query -> kinopub_id)
+kinopub_id_cache = {}
 
 # Хранилище для мониторинга задач загрузки
 # (task_id -> {'user_id': int, 'title': str, 'size': str, 'message_id': int})
@@ -295,10 +299,11 @@ async def process_search_query(message: Message, state: FSMContext):
         await message.answer("Пожалуйста, введите название фильма.")
         return
     
-    # Проверяем тип контента в кэше (для результатов из inline режима)
+    # Проверяем тип контента и ID кинопаба в кэше (для результатов из inline режима)
     # Нормализуем запрос для поиска в кэше
     normalized_query = ' '.join(query.lower().split())
     content_type = content_type_cache.get(normalized_query)
+    kinopub_id = kinopub_id_cache.get(normalized_query)
     
     # Формируем поисковый запрос: для сериалов убираем год, для фильмов оставляем
     search_query = query
@@ -347,6 +352,9 @@ async def process_search_query(message: Message, state: FSMContext):
                 torrent_data['content_type'] = 'serial'
             else:
                 torrent_data['content_type'] = 'movie'
+            # Сохраняем ID кинопаба, если он есть
+            if kinopub_id:
+                torrent_data['kinopub_id'] = kinopub_id
             torrents_dict[torrent_id] = torrent_data
         torrents_cache[user_id] = torrents_dict
         
@@ -405,13 +413,40 @@ async def process_search_query(message: Message, state: FSMContext):
         list_state_cache[user_id] = {
             'text': list_text,
             'keyboard': keyboard,
-            'filtered_torrents': filtered_torrents
+            'filtered_torrents': filtered_torrents,
+            'kinopub_id': kinopub_id  # Сохраняем ID кинопаба для отображения постера
         }
         
-        await search_msg.edit_text(
-            list_text,
-            reply_markup=keyboard
-        )
+        # Если есть ID кинопаба, отправляем постер вместе со списком
+        if kinopub_id:
+            poster_url = kinopub_client.get_poster_url(kinopub_id, big=True)
+            if poster_url:
+                try:
+                    # Удаляем сообщение о поиске и отправляем новое с постером
+                    await search_msg.delete()
+                    await bot.send_photo(
+                        chat_id=message.chat.id,
+                        photo=poster_url,
+                        caption=list_text,
+                        reply_markup=keyboard
+                    )
+                except Exception as e:
+                    logger.warning(f"Не удалось отправить постер: {e}")
+                    # Если не удалось отправить фото, отправляем текстовое сообщение
+                    await search_msg.edit_text(
+                        list_text,
+                        reply_markup=keyboard
+                    )
+            else:
+                await search_msg.edit_text(
+                    list_text,
+                    reply_markup=keyboard
+                )
+        else:
+            await search_msg.edit_text(
+                list_text,
+                reply_markup=keyboard
+            )
         
         await state.clear()
         
@@ -487,10 +522,11 @@ async def handle_inline_query(inline_query: InlineQuery):
             else:
                 message_text = movie_name
             
-            # Сохраняем тип контента в кэш для использования при поиске на rutracker
+            # Сохраняем тип контента и ID кинопаба в кэш для использования при поиске на rutracker
             # Нормализуем текст для поиска (убираем лишние пробелы, приводим к нижнему регистру)
             normalized_query = ' '.join(message_text.lower().split())
             content_type_cache[normalized_query] = item_type
+            kinopub_id_cache[normalized_query] = item_id
             
             # Используем InlineQueryResultArticle с миниатюрой для отображения постера слева и текста справа
             # Кнопка не нужна - при выборе результата сообщение автоматически отправится и выполнится поиск
@@ -549,10 +585,11 @@ async def handle_rutracker_search_from_kinopub(callback: CallbackQuery, state: F
         await callback.message.edit_text("❌ Не удалось извлечь название фильма.")
         return
     
-    # Проверяем тип контента в кэше (для результатов из inline режима)
+    # Проверяем тип контента и ID кинопаба в кэше (для результатов из inline режима)
     # Нормализуем запрос для поиска в кэше
     normalized_query = ' '.join(query.lower().split())
     content_type = content_type_cache.get(normalized_query)
+    kinopub_id = kinopub_id_cache.get(normalized_query)
     
     # Формируем поисковый запрос: для сериалов убираем год, для фильмов оставляем
     search_query = query
@@ -602,6 +639,9 @@ async def handle_rutracker_search_from_kinopub(callback: CallbackQuery, state: F
                 torrent_data['content_type'] = 'serial'
             else:
                 torrent_data['content_type'] = 'movie'
+            # Сохраняем ID кинопаба, если он есть
+            if kinopub_id:
+                torrent_data['kinopub_id'] = kinopub_id
             torrents_dict[torrent_id] = torrent_data
         torrents_cache[user_id] = torrents_dict
         
@@ -653,20 +693,76 @@ async def handle_rutracker_search_from_kinopub(callback: CallbackQuery, state: F
         list_state_cache[user_id] = {
             'text': list_text,
             'keyboard': keyboard,
-            'filtered_torrents': filtered_torrents
+            'filtered_torrents': filtered_torrents,
+            'kinopub_id': kinopub_id  # Сохраняем ID кинопаба для отображения постера
         }
         
         # Обновляем сообщение с результатами
-        if callback.message.photo:
-            await callback.message.edit_caption(
-                list_text,
-                reply_markup=keyboard
-            )
+        # Если есть ID кинопаба, показываем постер
+        if kinopub_id:
+            poster_url = kinopub_client.get_poster_url(kinopub_id, big=True)
+            if poster_url:
+                try:
+                    # Если сообщение уже содержит фото, редактируем его
+                    if callback.message.photo:
+                        await callback.message.edit_media(
+                            media=InputMediaPhoto(
+                                media=poster_url,
+                                caption=list_text
+                            ),
+                            reply_markup=keyboard
+                        )
+                    else:
+                        # Если сообщение текстовое, отправляем новое с фото
+                        chat_id = callback.message.chat.id
+                        sent_message = await bot.send_photo(
+                            chat_id=chat_id,
+                            photo=poster_url,
+                            caption=list_text,
+                            reply_markup=keyboard
+                        )
+                        # Удаляем старое текстовое сообщение
+                        try:
+                            await callback.message.delete()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.warning(f"Не удалось отправить постер: {e}")
+                    # Если не удалось отправить фото, отправляем текстовое сообщение
+                    if callback.message.photo:
+                        await callback.message.edit_caption(
+                            caption=list_text,
+                            reply_markup=keyboard
+                        )
+                    else:
+                        await callback.message.edit_text(
+                            list_text,
+                            reply_markup=keyboard
+                        )
+            else:
+                # Если URL постера не получен, отправляем текстовое сообщение
+                if callback.message.photo:
+                    await callback.message.edit_caption(
+                        caption=list_text,
+                        reply_markup=keyboard
+                    )
+                else:
+                    await callback.message.edit_text(
+                        list_text,
+                        reply_markup=keyboard
+                    )
         else:
-            await callback.message.edit_text(
-                list_text,
-                reply_markup=keyboard
-            )
+            # Если нет ID кинопаба, отправляем текстовое сообщение
+            if callback.message.photo:
+                await callback.message.edit_caption(
+                    caption=list_text,
+                    reply_markup=keyboard
+                )
+            else:
+                await callback.message.edit_text(
+                    list_text,
+                    reply_markup=keyboard
+                )
             
     except Exception as e:
         logger.error(f"Ошибка при поиске на RuTracker: {e}", exc_info=True)
@@ -702,6 +798,9 @@ async def handle_torrent_selection(callback: CallbackQuery, state: FSMContext):
     size_value = torrent_info.get('size_value', 0)
     unit = torrent_info.get('unit', '')
     
+    # Получаем ID кинопаба для постера
+    kinopub_id = torrent_info.get('kinopub_id')
+    
     # Формируем текст с деталями фильма
     details_text = (
         f"📽️ {title}\n\n"
@@ -725,11 +824,63 @@ async def handle_torrent_selection(callback: CallbackQuery, state: FSMContext):
     ]
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     
-    # Редактируем сообщение, показывая детали
-    await callback.message.edit_text(
-        details_text,
-        reply_markup=keyboard
-    )
+    # Если есть ID кинопаба, отправляем постер
+    if kinopub_id:
+        poster_url = kinopub_client.get_poster_url(kinopub_id, big=True)
+        if poster_url:
+            try:
+                # Если сообщение уже содержит фото, редактируем его
+                if callback.message.photo:
+                    await callback.message.edit_media(
+                        media=InputMediaPhoto(
+                            media=poster_url,
+                            caption=details_text
+                        ),
+                        reply_markup=keyboard
+                    )
+                else:
+                    # Если сообщение текстовое, отправляем новое сообщение с фото
+                    # В aiogram нельзя заменить текстовое сообщение на медиа через edit_media
+                    chat_id = callback.message.chat.id
+                    sent_message = await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=poster_url,
+                        caption=details_text,
+                        reply_markup=keyboard
+                    )
+                    # Удаляем старое текстовое сообщение
+                    try:
+                        await callback.message.delete()
+                    except Exception:
+                        pass  # Игнорируем ошибку, если сообщение уже удалено
+                    # Обновляем callback.message для корректной работы кнопки "Назад"
+                    # Это не сработает напрямую, но при нажатии "Назад" callback будет ссылаться на новое сообщение
+            except Exception as e:
+                # Если не удалось отправить фото, отправляем текстовое сообщение
+                logger.warning(f"Не удалось отправить постер: {e}")
+                try:
+                    await callback.message.edit_text(
+                        details_text,
+                        reply_markup=keyboard
+                    )
+                except Exception:
+                    # Если и редактирование не удалось, отправляем новое сообщение
+                    await callback.message.answer(
+                        details_text,
+                        reply_markup=keyboard
+                    )
+        else:
+            # Если URL постера не получен, отправляем текстовое сообщение
+            await callback.message.edit_text(
+                details_text,
+                reply_markup=keyboard
+            )
+    else:
+        # Если нет ID кинопаба, отправляем текстовое сообщение
+        await callback.message.edit_text(
+            details_text,
+            reply_markup=keyboard
+        )
 
 
 @dp.callback_query(F.data.startswith("download_"))
@@ -867,11 +1018,75 @@ async def handle_back_to_list(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("❌ Состояние списка не найдено.")
         return
     
+    # Получаем ID кинопаба из сохраненного состояния
+    kinopub_id = list_state.get('kinopub_id')
+    
     # Восстанавливаем список фильмов
-    await callback.message.edit_text(
-        list_state['text'],
-        reply_markup=list_state['keyboard']
-    )
+    # Если есть ID кинопаба, показываем постер
+    if kinopub_id:
+        poster_url = kinopub_client.get_poster_url(kinopub_id, big=True)
+        if poster_url:
+            try:
+                # Если сообщение уже содержит фото, редактируем его
+                if callback.message.photo:
+                    await callback.message.edit_media(
+                        media=InputMediaPhoto(
+                            media=poster_url,
+                            caption=list_state['text']
+                        ),
+                        reply_markup=list_state['keyboard']
+                    )
+                else:
+                    # Если сообщение текстовое, отправляем новое с фото
+                    chat_id = callback.message.chat.id
+                    sent_message = await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=poster_url,
+                        caption=list_state['text'],
+                        reply_markup=list_state['keyboard']
+                    )
+                    # Удаляем старое текстовое сообщение
+                    try:
+                        await callback.message.delete()
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(f"Не удалось отправить постер при возврате назад: {e}")
+                # Если не удалось отправить фото, отправляем текстовое сообщение
+                if callback.message.photo:
+                    await callback.message.edit_caption(
+                        caption=list_state['text'],
+                        reply_markup=list_state['keyboard']
+                    )
+                else:
+                    await callback.message.edit_text(
+                        list_state['text'],
+                        reply_markup=list_state['keyboard']
+                    )
+        else:
+            # Если URL постера не получен, отправляем текстовое сообщение
+            if callback.message.photo:
+                await callback.message.edit_caption(
+                    caption=list_state['text'],
+                    reply_markup=list_state['keyboard']
+                )
+            else:
+                await callback.message.edit_text(
+                    list_state['text'],
+                    reply_markup=list_state['keyboard']
+                )
+    else:
+        # Если нет ID кинопаба, отправляем текстовое сообщение
+        if callback.message.photo:
+            await callback.message.edit_caption(
+                caption=list_state['text'],
+                reply_markup=list_state['keyboard']
+            )
+        else:
+            await callback.message.edit_text(
+                list_state['text'],
+                reply_markup=list_state['keyboard']
+            )
 
 
 async def on_startup():
@@ -955,6 +1170,13 @@ async def main():
             await on_shutdown()
     else:
         # Запускаем бота в режиме polling
+        # Сначала удаляем webhook, если он был установлен ранее
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Webhook удален, переходим в режим polling")
+        except Exception as e:
+            logger.warning(f"Ошибка при удалении webhook (возможно, он не был установлен): {e}")
+        
         logger.info("Бот запущен в режиме polling")
         await dp.start_polling(bot)
 

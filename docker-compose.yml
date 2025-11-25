@@ -2,10 +2,7 @@ version: '3.8'
 
 services:
   bot:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: download_films_bot
+    image: tltroll/rutracker-to-synology
     restart: unless-stopped
     environment:
       # Telegram Bot

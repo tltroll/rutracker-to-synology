@@ -11,7 +11,8 @@ class KinopubSearchClient:
     """Клиент для поиска фильмов и сериалов на Kinopub."""
     
     BASE_URL = "https://api.kinopub.link/v1.1"
-    POSTER_BASE_URL = "https://m.pushbr.com/poster/item/small"
+    POSTER_BASE_URL_SMALL = "https://m.pushbr.com/poster/item/small"
+    POSTER_BASE_URL_BIG = "https://m.pushbr.com/poster/item/big"
     
     def __init__(self):
         """Инициализация клиента."""
@@ -57,7 +58,7 @@ class KinopubSearchClient:
                         'id': item.get('id'),
                         'title': item.get('value', ''),
                         'type': item.get('type', 'movie'),  # movie, serial, documovie
-                        'poster_url': self.get_poster_url(item.get('id'))
+                        'poster_url': self.get_poster_url(item.get('id'), big=False)
                     }
                     results.append(result)
                 
@@ -69,18 +70,20 @@ class KinopubSearchClient:
             return []
     
     @staticmethod
-    def get_poster_url(item_id: Optional[int]) -> Optional[str]:
+    def get_poster_url(item_id: Optional[int], big: bool = False) -> Optional[str]:
         """
         Формирует URL постера для фильма/сериала.
         
         Args:
             item_id: ID фильма/сериала
+            big: Если True, возвращает URL большого постера, иначе маленького
             
         Returns:
             URL постера или None
         """
         if item_id:
-            return f"{KinopubSearchClient.POSTER_BASE_URL}/{item_id}.jpg"
+            base_url = KinopubSearchClient.POSTER_BASE_URL_BIG if big else KinopubSearchClient.POSTER_BASE_URL_SMALL
+            return f"{base_url}/{item_id}.jpg"
         return None
     
     async def __aenter__(self):
