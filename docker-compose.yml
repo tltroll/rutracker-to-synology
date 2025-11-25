@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: download_films_bot
+    restart: unless-stopped
+    environment:
+      # Telegram Bot
+      - TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+      - WEBHOOK_URL=
+      # Rutracker
+      - RUTRACKER_LOGIN=your_rutracker_login
+      - RUTRACKER_PASSWORD=your_rutracker_password
+      - RUTRACKER_PROXY=
+      - RUTRACKER_USER_AGENT=
+      # Synology NAS
+      - SYNOLOGY_HOST=192.168.1.100
+      - SYNOLOGY_PORT=5000
+      - SYNOLOGY_USERNAME=your_synology_username
+      - SYNOLOGY_PASSWORD=your_synology_password
+      - SYNOLOGY_USE_HTTPS=False
+      # Download Station папки
+      - DOWNLOAD_STATION_FOLDER_1080=/downloads/1080p
+      - DOWNLOAD_STATION_FOLDER_2160=/downloads/2160p
+      - DOWNLOAD_STATION_FOLDER_SERIAL=/downloads/serials
+      # Разрешенные пользователи (ID через запятую)
+      - ALLOWED_USER_IDS=123456789,987654321
+    # Раскомментируйте, если используете webhook и нужно пробросить порт
+    # ports:
+    #   - "8000:8000"
+    volumes:
+      # Опционально: для логирования (если нужно сохранять логи)
+      - ./logs:/app/logs
+
