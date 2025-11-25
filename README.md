@@ -2,6 +2,8 @@
 
 A Telegram bot for searching and downloading movies and TV series from RuTracker and Kinopub, with automatic integration to Synology Download Station.
 
+[![GitHub](https://img.shields.io/badge/GitHub-Repository-blue)](https://github.com/tltroll/rutracker-to-synology)
+
 ## Features
 
 ### 🔍 Search Capabilities
@@ -52,8 +54,8 @@ A Telegram bot for searching and downloading movies and TV series from RuTracker
 ### 1. Clone the repository
 
 ```bash
-git clone <repository-url>
-cd download_films_bot
+git clone https://github.com/tltroll/rutracker-to-synology.git
+cd rutracker-to-synology
 ```
 
 ### 2. Install dependencies
@@ -63,7 +65,19 @@ pip install -r requirements.txt
 pip install py-rutracker-client==0.2.0
 ```
 
-### 3. Configure environment variables
+### 3. Configure Telegram Bot
+
+Before using the bot, you need to enable inline mode in BotFather:
+
+1. Open [@BotFather](https://t.me/BotFather) in Telegram
+2. Send `/mybots` command
+3. Select your bot
+4. Choose "Bot Settings" → "Inline Mode"
+5. Enable inline mode
+
+This is required for the inline search feature (Kinopub integration) to work.
+
+### 4. Configure environment variables
 
 Copy `env.example` to `.env` and fill in your credentials:
 
@@ -100,7 +114,7 @@ DOWNLOAD_STATION_FOLDER_SERIAL=/downloads/serials
 ALLOWED_USER_IDS=123456789,987654321
 ```
 
-### 4. Run the bot
+### 5. Run the bot
 
 ```bash
 python bot.py
@@ -169,17 +183,21 @@ docker run -d --env-file .env download-films-bot
 ## Project Structure
 
 ```
-download_films_bot/
+rutracker-to-synology/
 ├── bot.py                 # Main bot file with handlers
 ├── config.py              # Configuration management
 ├── rutracker_client.py    # RuTracker API client
 ├── kinopub_client.py      # Kinopub API client
 ├── synology_client.py     # Synology Download Station client
 ├── utils.py               # Utility functions (filtering, parsing)
+├── patches/               # Patches for synology_api library
+│   └── synology_api/
+│       └── downloadstation.py
 ├── docker-compose.yml     # Docker Compose configuration
 ├── Dockerfile             # Docker image definition
 ├── requirements.txt       # Python dependencies
-└── env.example            # Environment variables template
+├── env.example            # Environment variables template
+└── README.md              # This file
 ```
 
 ## Configuration Details
@@ -247,13 +265,13 @@ If `ALLOWED_USER_IDS` is set, only specified users can interact with the bot. Ot
 
 ## License
 
-[Add your license here]
+This project is open source and available under the MIT License.
 
 ## Contributing
 
-[Add contribution guidelines if needed]
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Support
 
-[Add support information if needed]
+If you encounter any issues or have questions, please open an issue on [GitHub](https://github.com/tltroll/rutracker-to-synology/issues).
 
