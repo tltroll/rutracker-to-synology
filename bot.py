@@ -193,15 +193,17 @@ class TaskMonitor:
                             )
                         ]])
                         
-                        await self.bot.edit_message_text(
+                        success_text = (
+                            f"✅ Загрузка завершена!\n\n"
+                            f"📽️ {title}\n"
+                            f"💾 Размер: {size}\n\n"
+                            f"🎉 Фильм готов к просмотру!"
+                        )
+                        
+                        await self._edit_message_safe(
                             chat_id=user_id,
                             message_id=message_id,
-                            text=(
-                                f"✅ Загрузка завершена!\n\n"
-                                f"📽️ {title}\n"
-                                f"💾 Размер: {size}\n\n"
-                                f"🎉 Фильм готов к просмотру!"
-                            ),
+                            text=success_text,
                             reply_markup=keyboard
                         )
                         logger.info(f"Задача {task_id} завершена, уведомление отправлено пользователю {user_id}")
@@ -419,7 +421,9 @@ async def process_search_query(message: Message, state: FSMContext):
         
         # Если есть ID кинопаба, отправляем постер вместе со списком
         if kinopub_id:
+            logger.debug(f"Найден kinopub_id: {kinopub_id} для запроса '{normalized_query}'")
             poster_url = kinopub_client.get_poster_url(kinopub_id, big=True)
+            logger.debug(f"URL постера: {poster_url}")
             if poster_url:
                 try:
                     # Удаляем сообщение о поиске и отправляем новое с постером
@@ -430,19 +434,22 @@ async def process_search_query(message: Message, state: FSMContext):
                         caption=list_text,
                         reply_markup=keyboard
                     )
+                    logger.info(f"Постер успешно отправлен для kinopub_id: {kinopub_id}")
                 except Exception as e:
-                    logger.warning(f"Не удалось отправить постер: {e}")
+                    logger.error(f"Не удалось отправить постер: {e}", exc_info=True)
                     # Если не удалось отправить фото, отправляем текстовое сообщение
                     await search_msg.edit_text(
                         list_text,
                         reply_markup=keyboard
                     )
             else:
+                logger.warning(f"URL постера не получен для kinopub_id: {kinopub_id}")
                 await search_msg.edit_text(
                     list_text,
                     reply_markup=keyboard
                 )
         else:
+            logger.debug(f"kinopub_id не найден в кэше для запроса '{normalized_query}'")
             await search_msg.edit_text(
                 list_text,
                 reply_markup=keyboard
@@ -569,7 +576,11 @@ async def handle_text_message(message: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("rutracker_search_"))
 async def handle_rutracker_search_from_kinopub(callback: CallbackQuery, state: FSMContext):
     """Обработчик кнопки поиска на RuTracker из результатов Kinopub."""
-    await callback.answer()
+    try:
+        await callback.answer()
+    except Exception as e:
+        # Игнорируем ошибки при ответе на callback
+        logger.debug(f"Не удалось ответить на callback: {e}")
     
     # Извлекаем ID из callback_data
     kinopub_id = callback.data.replace("rutracker_search_", "")
@@ -714,6 +725,7 @@ async def handle_rutracker_search_from_kinopub(callback: CallbackQuery, state: F
                         )
                     else:
                         # Если сообщение текстовое, отправляем новое с фото
+                        # Не удаляем старое сообщение, чтобы не нарушать callback
                         chat_id = callback.message.chat.id
                         sent_message = await bot.send_photo(
                             chat_id=chat_id,
@@ -721,11 +733,8 @@ async def handle_rutracker_search_from_kinopub(callback: CallbackQuery, state: F
                             caption=list_text,
                             reply_markup=keyboard
                         )
-                        # Удаляем старое текстовое сообщение
-                        try:
-                            await callback.message.delete()
-                        except Exception:
-                            pass
+                        # Старое сообщение оставляем, чтобы callback оставался валидным
+                        # Пользователь увидит новое сообщение с постером
                 except Exception as e:
                     logger.warning(f"Не удалось отправить постер: {e}")
                     # Если не удалось отправить фото, отправляем текстовое сообщение
@@ -771,10 +780,45 @@ async def handle_rutracker_search_from_kinopub(callback: CallbackQuery, state: F
         )
 
 
+async def edit_message_safe(message: Message, text: str, reply_markup=None):
+    """
+    Безопасное редактирование сообщения - проверяет тип сообщения и использует соответствующий метод.
+    
+    Args:
+        message: Сообщение для редактирования
+        text: Текст для отображения
+        reply_markup: Клавиатура (опционально)
+    """
+    try:
+        if message.photo:
+            # Если сообщение содержит фото, редактируем caption
+            await message.edit_caption(
+                caption=text,
+                reply_markup=reply_markup
+            )
+        else:
+            # Если сообщение текстовое, редактируем текст
+            await message.edit_text(
+                text,
+                reply_markup=reply_markup
+            )
+    except Exception as e:
+        logger.warning(f"Ошибка при редактировании сообщения: {e}")
+        # Если не удалось отредактировать, пытаемся отправить новое сообщение
+        try:
+            await message.answer(text, reply_markup=reply_markup)
+        except Exception:
+            pass
+
+
 @dp.callback_query(F.data.startswith("torrent_"))
 async def handle_torrent_selection(callback: CallbackQuery, state: FSMContext):
     """Обработчик выбора торрента - показывает детали фильма."""
-    await callback.answer()
+    try:
+        await callback.answer()
+    except Exception as e:
+        # Игнорируем ошибки при ответе на callback (например, если сообщение было удалено)
+        logger.debug(f"Не удалось ответить на callback: {e}")
     
     # Парсим callback_data: torrent_ID_RESOLUTION
     parts = callback.data.replace("torrent_", "").split("_")
@@ -790,7 +834,7 @@ async def handle_torrent_selection(callback: CallbackQuery, state: FSMContext):
     torrent_info = torrents_data.get(torrent_id, {})
     
     if not torrent_info:
-        await callback.message.edit_text("❌ Информация о торренте не найдена.")
+        await edit_message_safe(callback.message, "❌ Информация о торренте не найдена.")
         return
     
     # Получаем title и size
@@ -848,13 +892,8 @@ async def handle_torrent_selection(callback: CallbackQuery, state: FSMContext):
                         caption=details_text,
                         reply_markup=keyboard
                     )
-                    # Удаляем старое текстовое сообщение
-                    try:
-                        await callback.message.delete()
-                    except Exception:
-                        pass  # Игнорируем ошибку, если сообщение уже удалено
-                    # Обновляем callback.message для корректной работы кнопки "Назад"
-                    # Это не сработает напрямую, но при нажатии "Назад" callback будет ссылаться на новое сообщение
+                    # Не удаляем старое сообщение, чтобы не нарушать callback
+                    # Пользователь увидит новое сообщение с постером
             except Exception as e:
                 # Если не удалось отправить фото, отправляем текстовое сообщение
                 logger.warning(f"Не удалось отправить постер: {e}")
@@ -886,7 +925,11 @@ async def handle_torrent_selection(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("download_"))
 async def handle_download(callback: CallbackQuery, state: FSMContext):
     """Обработчик кнопки 'Скачать' - отправляет торрент в Download Station."""
-    await callback.answer()
+    try:
+        await callback.answer()
+    except Exception as e:
+        # Игнорируем ошибки при ответе на callback
+        logger.debug(f"Не удалось ответить на callback: {e}")
     
     # Парсим callback_data: download_ID_RESOLUTION
     parts = callback.data.replace("download_", "").split("_")
@@ -902,7 +945,7 @@ async def handle_download(callback: CallbackQuery, state: FSMContext):
     torrent_info = torrents_data.get(torrent_id, {})
     
     if not torrent_info:
-        await callback.message.edit_text("❌ Информация о торренте не найдена.")
+        await edit_message_safe(callback.message, "❌ Информация о торренте не найдена.")
         return
     
     # Получаем title и size
@@ -911,22 +954,24 @@ async def handle_download(callback: CallbackQuery, state: FSMContext):
     unit = torrent_info.get('unit', '')
     
     # Редактируем сообщение, показывая процесс загрузки
-    await callback.message.edit_text(
+    loading_text = (
         f"⏳ Скачиваю торрент и добавляю в Download Station...\n\n"
         f"📽️ {title}\n"
         f"💾 Размер: {size_value} {unit}"
     )
+    await edit_message_safe(callback.message, loading_text)
     
     try:
         # Скачиваем торрент-файл
         torrent_data = await rutracker_client.download_torrent(torrent_id)
         
         if not torrent_data:
-            await callback.message.edit_text(
+            error_text = (
                 f"❌ Не удалось скачать торрент-файл.\n\n"
                 f"📽️ {title}\n"
                 f"💾 Размер: {size_value} {unit}"
             )
+            await edit_message_safe(callback.message, error_text)
             return
         
         # Определяем папку назначения в зависимости от типа контента и разрешения
@@ -970,14 +1015,14 @@ async def handle_download(callback: CallbackQuery, state: FSMContext):
                 )
             ]])
             
-            await callback.message.edit_text(
+            success_text = (
                 f"✅ Торрент успешно добавлен в Download Station!\n\n"
                 f"📽️ {title}\n"
                 f"💾 Размер: {size_value} {unit}\n"
                 f"📁 Папка: {destination_folder}\n\n"
-                f"⏳ Начинаю мониторинг загрузки...",
-                reply_markup=keyboard
+                f"⏳ Начинаю мониторинг загрузки..."
             )
+            await edit_message_safe(callback.message, success_text, reply_markup=keyboard)
             
             # Запускаем мониторинг задачи
             if task_monitor:
@@ -991,25 +1036,31 @@ async def handle_download(callback: CallbackQuery, state: FSMContext):
             else:
                 logger.warning("TaskMonitor не инициализирован, мониторинг не запущен")
         else:
-            await callback.message.edit_text(
+            error_text = (
                 f"❌ Не удалось добавить торрент в Download Station.\n\n"
                 f"📽️ {title}\n"
                 f"💾 Размер: {size_value} {unit}"
             )
+            await edit_message_safe(callback.message, error_text)
             
     except Exception as e:
         logger.error(f"Ошибка при обработке торрента: {e}", exc_info=True)
-        await callback.message.edit_text(
+        error_text = (
             f"❌ Произошла ошибка: {str(e)}\n\n"
             f"📽️ {title}\n"
             f"💾 Размер: {size_value} {unit}"
         )
+        await edit_message_safe(callback.message, error_text)
 
 
 @dp.callback_query(F.data == "back_to_list")
 async def handle_back_to_list(callback: CallbackQuery, state: FSMContext):
     """Обработчик кнопки 'Назад' - возвращает к списку фильмов."""
-    await callback.answer()
+    try:
+        await callback.answer()
+    except Exception as e:
+        # Игнорируем ошибки при ответе на callback
+        logger.debug(f"Не удалось ответить на callback: {e}")
     
     user_id = callback.from_user.id
     list_state = list_state_cache.get(user_id)
@@ -1045,11 +1096,8 @@ async def handle_back_to_list(callback: CallbackQuery, state: FSMContext):
                         caption=list_state['text'],
                         reply_markup=list_state['keyboard']
                     )
-                    # Удаляем старое текстовое сообщение
-                    try:
-                        await callback.message.delete()
-                    except Exception:
-                        pass
+                    # Не удаляем старое сообщение, чтобы не нарушать callback
+                    # Пользователь увидит новое сообщение с постером
             except Exception as e:
                 logger.warning(f"Не удалось отправить постер при возврате назад: {e}")
                 # Если не удалось отправить фото, отправляем текстовое сообщение
