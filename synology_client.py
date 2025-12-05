@@ -38,6 +38,19 @@ class SynologyDownloadClient:
         """Выполняет повторную аутентификацию при ошибке сессии."""
         try:
             logger.info("Выполняется повторная аутентификация...")
+            
+            # Пытаемся закрыть старую сессию, если есть метод logout
+            old_ds = self.ds
+            try:
+                if hasattr(old_ds, 'session') and hasattr(old_ds.session, 'logout'):
+                    old_ds.session.logout()
+                    logger.debug("Старая сессия закрыта через logout")
+            except Exception as logout_error:
+                logger.debug(f"Не удалось закрыть старую сессию через logout: {logout_error}")
+            
+            # Явно удаляем старый объект для освобождения ресурсов
+            del old_ds
+            
             # Пересоздаем клиент для получения новой сессии
             self.ds = downloadstation.DownloadStation(
                 ip_address=SYNOLOGY_HOST,
@@ -47,10 +60,30 @@ class SynologyDownloadClient:
                 secure=SYNOLOGY_USE_HTTPS,
                 download_st_version=2
             )
+            
             # Выполняем тестовый запрос для аутентификации
-            self.ds.get_info()
+            # При первом вызове библиотека автоматически аутентифицируется
+            result = self.ds.get_info()
+            
+            # Проверяем, что запрос успешен (не ошибка 105 или 119)
+            if isinstance(result, dict):
+                error = result.get('error')
+                if error and isinstance(error, dict):
+                    error_code = error.get('code')
+                    if error_code in [105, 119]:
+                        logger.error(f"Ошибка при повторной аутентификации: код {error_code}")
+                        return False
+            
             logger.info("Повторная аутентификация выполнена успешно")
             return True
+        except DownloadStationError as e:
+            # Если это ошибка 105 или 119, значит переаутентификация не удалась
+            if hasattr(e, 'error_code') and e.error_code in [105, 119]:
+                logger.error(f"Ошибка при повторной аутентификации: код {e.error_code} - {e}")
+                return False
+            # Другие ошибки тоже считаем неудачей
+            logger.error(f"Ошибка при повторной аутентификации: {e}", exc_info=True)
+            return False
         except Exception as e:
             logger.error(f"Ошибка при повторной аутентификации: {e}", exc_info=True)
             return False
@@ -71,9 +104,10 @@ class SynologyDownloadClient:
             error_code = error.get('code') if isinstance(error, dict) else None
             error_message = error.get('message', 'Неизвестная ошибка') if isinstance(error, dict) else str(error)
             
-            # Если это ошибка сессии (119), пытаемся переаутентифицироваться
-            if error_code == 119:
-                logger.warning(f"Обнаружена ошибка сессии (119): {error_message}")
+            # Если это ошибка сессии (119) или ошибка прав доступа (105), пытаемся переаутентифицироваться
+            # Ошибка 105 может возникать при использовании истекшей сессии
+            if error_code in [105, 119]:
+                logger.warning(f"Обнаружена ошибка сессии ({error_code}): {error_message}")
                 if self._reauthenticate():
                     return ('retry', error_code, error_message)
                 else:
@@ -86,8 +120,9 @@ class SynologyDownloadClient:
             error_code = result.get('error', {}).get('code') if isinstance(result.get('error'), dict) else None
             error_message = result.get('error', {}).get('message', 'Операция не выполнена') if isinstance(result.get('error'), dict) else 'Операция не выполнена'
             
-            if error_code == 119:
-                logger.warning(f"Обнаружена ошибка сессии (119): {error_message}")
+            # Если это ошибка сессии (119) или ошибка прав доступа (105), пытаемся переаутентифицироваться
+            if error_code in [105, 119]:
+                logger.warning(f"Обнаружена ошибка сессии ({error_code}): {error_message}")
                 if self._reauthenticate():
                     return ('retry', error_code, error_message)
                 else:
@@ -178,8 +213,8 @@ class SynologyDownloadClient:
             # Если результат - строка, это может быть ошибка
             if isinstance(result, str):
                 logger.error(f"Ошибка при создании задачи: {result}")
-                # Проверяем, не является ли это ошибкой сессии
-                if "119" in result or "SID" in result.upper() or "session" in result.lower():
+                # Проверяем, не является ли это ошибкой сессии (105 или 119)
+                if "105" in result or "119" in result or "SID" in result.upper() or "session" in result.lower():
                     logger.warning("Возможная ошибка сессии, пытаемся переаутентифицироваться...")
                     if self._reauthenticate():
                         # Повторяем попытку
@@ -381,27 +416,59 @@ class SynologyDownloadClient:
                 'error': str | None  # сообщение об ошибке если есть
             }
         """
-        try:
-            # Используем tasks_list для получения всех задач и ищем нужную по ID
-            logger.debug(f"Получение статуса задачи {task_id}")
-            result = self.ds.tasks_list(
-                additional_param=['detail']
-            )
-            
-            # Проверяем на наличие ошибок
-            is_error, error_code, error_message = self._check_and_handle_error(result)
-            
-            if is_error == 'retry':
-                logger.info("Повторная попытка получения статуса после переаутентификации...")
+        max_retries = 2
+        retry_count = 0
+        result = None
+        
+        while retry_count <= max_retries:
+            try:
+                # Используем tasks_list для получения всех задач и ищем нужную по ID
+                logger.debug(f"Получение статуса задачи {task_id} (попытка {retry_count + 1})")
                 result = self.ds.tasks_list(
                     additional_param=['detail']
                 )
+                
+                # Проверяем на наличие ошибок
                 is_error, error_code, error_message = self._check_and_handle_error(result)
-            
-            if is_error:
-                logger.error(f"Ошибка при получении статуса задачи {task_id}: {error_code} - {error_message}")
+                
+                if is_error == 'retry':
+                    logger.info("Повторная попытка получения статуса после переаутентификации...")
+                    result = self.ds.tasks_list(
+                        additional_param=['detail']
+                    )
+                    is_error, error_code, error_message = self._check_and_handle_error(result)
+                
+                if is_error:
+                    logger.error(f"Ошибка при получении статуса задачи {task_id}: {error_code} - {error_message}")
+                    return None
+                
+                # Если успешно получили результат, выходим из цикла
+                break
+                
+            except DownloadStationError as e:
+                # Если это ошибка сессии (105 или 119), пытаемся переаутентифицироваться
+                if hasattr(e, 'error_code') and e.error_code in [105, 119]:
+                    logger.warning(f"Ошибка сессии ({e.error_code}) при получении статуса задачи {task_id}, пытаемся переаутентифицироваться...")
+                    if self._reauthenticate() and retry_count < max_retries:
+                        retry_count += 1
+                        continue  # Повторяем попытку
+                    else:
+                        logger.error(f"Не удалось переаутентифицироваться или превышено количество попыток при получении статуса задачи {task_id}")
+                        return None
+                else:
+                    logger.error(f"DownloadStationError при получении статуса задачи {task_id}: {e.error_code} - {e}")
+                    return None
+            except Exception as e:
+                logger.error(f"Ошибка при получении статуса задачи {task_id}: {e}", exc_info=True)
                 return None
-            
+        
+        # Если мы дошли сюда, значит не удалось получить результат после всех попыток
+        if result is None:
+            logger.error(f"Не удалось получить результат для задачи {task_id} после всех попыток")
+            return None
+        
+        # Продолжаем обработку успешного результата
+        try:
             # Проверяем структуру ответа
             if not isinstance(result, dict):
                 logger.warning(f"Неожиданный тип ответа для задачи {task_id}: {type(result)}, значение: {result}")
@@ -509,11 +576,7 @@ class SynologyDownloadClient:
             
             logger.debug(f"Статус задачи {task_id}: {status}, название: {task.get('title', 'N/A')}")
             return result_dict
-            
-        except DownloadStationError as e:
-            logger.error(f"DownloadStationError при получении статуса задачи {task_id}: {e.error_code} - {e}")
-            return None
         except Exception as e:
-            logger.error(f"Ошибка при получении статуса задачи {task_id}: {e}", exc_info=True)
+            logger.error(f"Ошибка при обработке результата для задачи {task_id}: {e}", exc_info=True)
             return None
 
