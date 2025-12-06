@@ -106,8 +106,9 @@ class SynologyDownloadClient:
             
             # Если это ошибка сессии (119) или ошибка прав доступа (105), пытаемся переаутентифицироваться
             # Ошибка 105 может возникать при использовании истекшей сессии
-            if error_code in [105, 119]:
-                logger.warning(f"Обнаружена ошибка сессии ({error_code}): {error_message}")
+            # Ошибка 106 (Invalid parameter) также может возникать при истекшей сессии при длительной работе
+            if error_code in [105, 106, 119]:
+                logger.warning(f"Обнаружена возможная ошибка сессии ({error_code}): {error_message}")
                 if self._reauthenticate():
                     return ('retry', error_code, error_message)
                 else:
@@ -121,8 +122,9 @@ class SynologyDownloadClient:
             error_message = result.get('error', {}).get('message', 'Операция не выполнена') if isinstance(result.get('error'), dict) else 'Операция не выполнена'
             
             # Если это ошибка сессии (119) или ошибка прав доступа (105), пытаемся переаутентифицироваться
-            if error_code in [105, 119]:
-                logger.warning(f"Обнаружена ошибка сессии ({error_code}): {error_message}")
+            # Ошибка 106 (Invalid parameter) также может возникать при истекшей сессии при длительной работе
+            if error_code in [105, 106, 119]:
+                logger.warning(f"Обнаружена возможная ошибка сессии ({error_code}): {error_message}")
                 if self._reauthenticate():
                     return ('retry', error_code, error_message)
                 else:
@@ -209,12 +211,33 @@ class SynologyDownloadClient:
                     create_list=False
                 )
                 is_error, error_code, error_message = self._check_and_handle_error(result)
+                # Если после retry все еще ошибка 106, пробуем без destination
+                if is_error and is_error != 'retry' and error_code == 106:
+                    logger.warning(f"Ошибка 106 после переаутентификации, пробуем без destination...")
+                    try:
+                        result = self.ds.create_task_torrent(
+                            file_path=str(torrent_file_path),
+                            destination="",
+                            create_list=False
+                        )
+                        is_error, error_code, error_message = self._check_and_handle_error(result)
+                        if is_error:
+                            logger.error(
+                                f"Ошибка при создании задачи без destination: Ошибка API: {error_code} "
+                                f"Сообщение: {error_message}"
+                            )
+                            return None
+                        # Если успешно, продолжаем обработку ниже
+                    except Exception as e:
+                        logger.error(f"Ошибка при попытке загрузки без destination: {e}")
+                        return None
             
             # Если результат - строка, это может быть ошибка
             if isinstance(result, str):
                 logger.error(f"Ошибка при создании задачи: {result}")
-                # Проверяем, не является ли это ошибкой сессии (105 или 119)
-                if "105" in result or "119" in result or "SID" in result.upper() or "session" in result.lower():
+                # Проверяем, не является ли это ошибкой сессии (105, 106 или 119)
+                # Ошибка 106 может возникать при истекшей сессии при длительной работе
+                if "105" in result or "106" in result or "119" in result or "SID" in result.upper() or "session" in result.lower():
                     logger.warning("Возможная ошибка сессии, пытаемся переаутентифицироваться...")
                     if self._reauthenticate():
                         # Повторяем попытку
@@ -224,13 +247,51 @@ class SynologyDownloadClient:
                             create_list=False
                         )
                         is_error, error_code, error_message = self._check_and_handle_error(result)
-                        if is_error:
-                            logger.error(
-                                f"Ошибка при создании задачи после повторной попытки: "
-                                f"Ошибка API: {error_code} (детали: {{'code': {error_code}}}) "
-                                f"при скачивании торрента. Сообщение: {error_message}"
+                        # Если после переаутентификации все еще ошибка, но не retry, обрабатываем дальше
+                        if is_error and is_error != 'retry':
+                            # Если это ошибка 106, пробуем без destination
+                            if error_code == 106:
+                                logger.warning(f"Ошибка 106 после переаутентификации, пробуем без destination...")
+                                try:
+                                    result = self.ds.create_task_torrent(
+                                        file_path=str(torrent_file_path),
+                                        destination="",
+                                        create_list=False
+                                    )
+                                    is_error, error_code, error_message = self._check_and_handle_error(result)
+                                    if is_error:
+                                        logger.error(
+                                            f"Ошибка при создании задачи без destination: Ошибка API: {error_code} "
+                                            f"Сообщение: {error_message}"
+                                        )
+                                        return None
+                                    # Если успешно, продолжаем обработку ниже
+                                except Exception as e:
+                                    logger.error(f"Ошибка при попытке загрузки без destination: {e}")
+                                    return None
+                            else:
+                                logger.error(
+                                    f"Ошибка при создании задачи после повторной попытки: "
+                                    f"Ошибка API: {error_code} (детали: {{'code': {error_code}}}) "
+                                    f"при скачивании торрента. Сообщение: {error_message}"
+                                )
+                                return None
+                        elif is_error == 'retry':
+                            # Еще одна попытка после retry
+                            logger.info("Повторная попытка после переаутентификации (второй раз)...")
+                            result = self.ds.create_task_torrent(
+                                file_path=str(torrent_file_path),
+                                destination=destination_folder,
+                                create_list=False
                             )
-                            return None
+                            is_error, error_code, error_message = self._check_and_handle_error(result)
+                            if is_error:
+                                logger.error(
+                                    f"Ошибка при создании задачи после второй попытки: "
+                                    f"Ошибка API: {error_code} (детали: {{'code': {error_code}}}) "
+                                    f"при скачивании торрента. Сообщение: {error_message}"
+                                )
+                                return None
                     else:
                         return None
                 else:
@@ -239,8 +300,9 @@ class SynologyDownloadClient:
             # Если есть ошибка, логируем и возвращаем None
             if is_error:
                 # Ошибка 106 обычно означает "Invalid parameter"
-                # Попробуем загрузить без destination, если указанный путь неверен
-                if error_code == 106:
+                # Но при длительной работе может возникать из-за истекшей сессии
+                # Если это не retry (т.е. переаутентификация не помогла), пробуем загрузить без destination
+                if error_code == 106 and is_error != 'retry':
                     logger.warning(f"Ошибка 106 (Invalid parameter) при загрузке с destination={destination_folder}")
                     logger.info("Пробуем загрузить без указания destination...")
                     try:
@@ -263,13 +325,15 @@ class SynologyDownloadClient:
                     except Exception as e:
                         logger.error(f"Ошибка при попытке загрузки без destination: {e}")
                         return None
-                else:
+                elif is_error != 'retry':
                     logger.error(
                         f"Ошибка при создании задачи: Ошибка API: {error_code} "
                         f"(детали: {{'code': {error_code}}}) при скачивании торрента. "
                         f"Сообщение: {error_message}"
                     )
                     return None
+                # Если is_error == 'retry', значит переаутентификация прошла успешно, но запрос еще не повторен
+                # Это обрабатывается выше в коде
             
             # Обрабатываем успешный результат
             if result and isinstance(result, dict):
