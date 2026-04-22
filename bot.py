@@ -14,7 +14,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from config import TELEGRAM_BOT_TOKEN, validate_config, ALLOWED_USER_IDS, WEBHOOK_URL
+from py_rutracker.exceptions import RuTrackerAuthError, RuTrackerRequestError
+
+from config import (
+    TELEGRAM_BOT_TOKEN, validate_config, ALLOWED_USER_IDS, WEBHOOK_URL,
+    RUTRACKER_MIN_SEEDERS,
+)
 from rutracker_client import RutrackerSearchClient
 from kinopub_client import KinopubSearchClient
 from synology_client import SynologyDownloadClient
@@ -162,8 +167,11 @@ class TaskMonitor:
             iteration += 1
             try:
                 logger.info(f"Проверка #{iteration} статуса задачи {task_id}")
-                # Получаем статус задачи
-                status_info = self.synology_client.get_task_status(task_id)
+                # Получаем статус задачи через to_thread, чтобы блокирующий
+                # HTTP-запрос к Synology не тормозил event loop aiogram
+                status_info = await asyncio.to_thread(
+                    self.synology_client.get_task_status, task_id
+                )
                 
                 if not status_info:
                     # Если не удалось получить статус, возможно задача удалена из Download Station
@@ -330,8 +338,17 @@ async def process_search_query(message: Message, state: FSMContext):
             await state.clear()
             return
         
-        # Фильтруем и приоритизируем результаты
-        filtered_torrents = filter_torrents(torrents, max_results=15)
+        # Год берём из запроса только для фильмов (для сериалов он уже вырезан)
+        expected_year = extract_year(query) if content_type != "serial" else None
+        
+        # Фильтруем и приоритизируем результаты с учётом контекста из Kinopub
+        filtered_torrents = filter_torrents(
+            torrents,
+            max_results=15,
+            content_type=content_type,
+            expected_year=expected_year or None,
+            min_seeders=RUTRACKER_MIN_SEEDERS,
+        )
         
         if not filtered_torrents:
             await search_msg.edit_text(
@@ -368,12 +385,12 @@ async def process_search_query(message: Message, state: FSMContext):
             # Извлекаем только название фильма (до первой скобки)
             movie_name = extract_movie_name(full_title)
             
-            # Извлекаем год, разрешение и HDR/DV
             year = extract_year(full_title)
             resolution = extract_resolution(full_title)
             hdr_dv_icons = get_hdr_dv_icons(full_title)
-            
-            # Формируем текст кнопки: название, год, разрешение, HDR/DV (в виде значков)
+            size_value = torrent.get('size_value')
+            unit = torrent.get('unit', '')
+
             parts = [movie_name]
             if year:
                 parts.append(str(year))
@@ -383,10 +400,11 @@ async def process_search_query(message: Message, state: FSMContext):
                     parts.append(resolution_icon)
             if hdr_dv_icons:
                 parts.append(hdr_dv_icons)
-            
+            if size_value:
+                parts.append(f"{size_value} {unit}".strip())
+
             button_text = ' '.join(parts)
-            
-            # Передаем ID и разрешение через callback_data
+
             callback_data = f"torrent_{torrent.get('id')}_{resolution}"
             
             keyboard_buttons.append([
@@ -457,6 +475,18 @@ async def process_search_query(message: Message, state: FSMContext):
         
         await state.clear()
         
+    except RuTrackerAuthError as e:
+        logger.error("Ошибка авторизации на RuTracker: %s", e, exc_info=True)
+        await search_msg.edit_text(
+            "❌ Ошибка авторизации на RuTracker. Проверьте логин и пароль в настройках."
+        )
+        await state.clear()
+    except RuTrackerRequestError as e:
+        logger.error("Сетевая ошибка при обращении к RuTracker: %s", e, exc_info=True)
+        await search_msg.edit_text(
+            "❌ Не удалось связаться с RuTracker. Попробуйте позже."
+        )
+        await state.clear()
     except Exception as e:
         logger.error(f"Ошибка при поиске: {e}", exc_info=True)
         await search_msg.edit_text(
@@ -627,8 +657,17 @@ async def handle_rutracker_search_from_kinopub(callback: CallbackQuery, state: F
             )
             return
         
-        # Фильтруем и приоритизируем результаты
-        filtered_torrents = filter_torrents(torrents, max_results=15)
+        # Год берём из исходного запроса только для фильмов
+        expected_year = extract_year(query) if content_type != "serial" else None
+        
+        # Фильтруем и приоритизируем результаты с учётом контекста из Kinopub
+        filtered_torrents = filter_torrents(
+            torrents,
+            max_results=15,
+            content_type=content_type,
+            expected_year=expected_year or None,
+            min_seeders=RUTRACKER_MIN_SEEDERS,
+        )
         
         if not filtered_torrents:
             await callback.message.edit_caption(
@@ -665,6 +704,9 @@ async def handle_rutracker_search_from_kinopub(callback: CallbackQuery, state: F
             resolution = extract_resolution(full_title)
             hdr_dv_icons = get_hdr_dv_icons(full_title)
             
+            size_value = torrent.get('size_value')
+            unit = torrent.get('unit', '')
+
             parts = [movie_name]
             if year:
                 parts.append(str(year))
@@ -674,7 +716,9 @@ async def handle_rutracker_search_from_kinopub(callback: CallbackQuery, state: F
                     parts.append(resolution_icon)
             if hdr_dv_icons:
                 parts.append(hdr_dv_icons)
-            
+            if size_value:
+                parts.append(f"{size_value} {unit}".strip())
+
             button_text = ' '.join(parts)
             callback_data = f"torrent_{torrent.get('id')}_{resolution}"
             
@@ -773,6 +817,16 @@ async def handle_rutracker_search_from_kinopub(callback: CallbackQuery, state: F
                     reply_markup=keyboard
                 )
             
+    except RuTrackerAuthError as e:
+        logger.error("Ошибка авторизации на RuTracker: %s", e, exc_info=True)
+        await callback.message.edit_caption(
+            "❌ Ошибка авторизации на RuTracker. Проверьте логин и пароль в настройках."
+        )
+    except RuTrackerRequestError as e:
+        logger.error("Сетевая ошибка при обращении к RuTracker: %s", e, exc_info=True)
+        await callback.message.edit_caption(
+            "❌ Не удалось связаться с RuTracker. Попробуйте позже."
+        )
     except Exception as e:
         logger.error(f"Ошибка при поиске на RuTracker: {e}", exc_info=True)
         await callback.message.edit_caption(
@@ -999,11 +1053,13 @@ async def handle_download(callback: CallbackQuery, state: FSMContext):
             # Для фильмов разделяем по разрешению
             destination_folder = DOWNLOAD_STATION_FOLDER_2160 if resolution == 2160 else DOWNLOAD_STATION_FOLDER_1080
         
-        # Добавляем торрент в Download Station
-        task_id = synology_client.add_torrent_file(
-            torrent_data=torrent_data,
-            destination_folder=destination_folder,
-            priority="high"
+        # Добавляем торрент в Download Station через to_thread, чтобы не
+        # блокировать event loop aiogram во время HTTP-запроса к NAS
+        task_id = await asyncio.to_thread(
+            synology_client.add_torrent_file,
+            torrent_data,
+            destination_folder,
+            "high",
         )
         
         if task_id:
@@ -1148,6 +1204,7 @@ async def on_shutdown():
     logger.info("Бот остановлен")
     await rutracker_client.close()
     await kinopub_client.close()
+    await asyncio.to_thread(synology_client.close)
 
 
 async def main():

@@ -1,646 +1,492 @@
-"""Клиент для работы с Synology Download Station."""
+"""Клиент для работы с Synology Download Station.
+
+Особенности:
+- Автоматическое восстановление истекшей сессии (коды 105/106/107/117/118/119).
+- Проактивное обновление сессии через заданный интервал, чтобы предотвратить
+  неожиданные истечения при длительной работе.
+- Thread-safe: защищает вызовы и переавторизацию RLock'ом, что важно при
+  параллельном мониторинге задач загрузки.
+- Корректный сброс общей сессии библиотеки (`BaseApi.shared_session`) вместо
+  ненадёжного `importlib.reload`.
+"""
+from __future__ import annotations
+
 import logging
-import tempfile
 import os
-from typing import Optional
+import tempfile
+import threading
+import time
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional
+
 from synology_api import downloadstation
-from synology_api.exceptions import DownloadStationError
+from synology_api.base_api import BaseApi
+from synology_api.exceptions import (
+    DownloadStationError,
+    HTTPError,
+    LoginError,
+    SynoBaseException,
+    SynoConnectionError,
+)
+
 from config import (
-    SYNOLOGY_HOST,
-    SYNOLOGY_PORT,
-    SYNOLOGY_USERNAME,
-    SYNOLOGY_PASSWORD,
-    SYNOLOGY_USE_HTTPS,
     DOWNLOAD_STATION_FOLDER_1080,
     DOWNLOAD_STATION_FOLDER_2160,
-    DOWNLOAD_STATION_FOLDER_SERIAL,
+    SYNOLOGY_HOST,
+    SYNOLOGY_PASSWORD,
+    SYNOLOGY_PORT,
+    SYNOLOGY_USE_HTTPS,
+    SYNOLOGY_USERNAME,
 )
 
 logger = logging.getLogger(__name__)
 
+# Коды ошибок Synology, которые означают проблему с текущей сессией и
+# требуют повторной авторизации.
+#   105 - The logged in session does not have permission
+#   106 - Session timeout
+#   107 - Session interrupted by duplicated login
+#   117, 118 - Network unstable / system busy (временные)
+#   119 - Invalid session / SID not found
+SESSION_ERROR_CODES: frozenset[int] = frozenset({105, 106, 107, 117, 118, 119})
+
+# Коды ошибок Download Station, связанные с параметром destination.
+# При их появлении имеет смысл повторить запрос без destination.
+DESTINATION_ERROR_CODES: frozenset[int] = frozenset({101, 402, 403, 406})
+
+# Максимальное количество повторных попыток при ошибках сессии/сети.
+MAX_RETRIES: int = 2
+
+# Принудительное обновление сессии каждые N секунд.
+# Работает как защита от "тихого" истечения сессии на стороне NAS.
+SESSION_REFRESH_INTERVAL: float = 30 * 60  # 30 минут
+
+# Маппинг статусов задач DownloadStation к унифицированным значениям.
+_NUMERIC_STATUS_MAP: dict[int, str] = {
+    1: "waiting",
+    2: "downloading",
+    3: "paused",
+    4: "finishing",
+    5: "finished",
+    6: "error",
+    7: "finished",  # seeding
+    8: "finished",
+    9: "downloading",
+}
+
+_STRING_STATUS_MAP: dict[str, str] = {
+    "waiting": "waiting",
+    "downloading": "downloading",
+    "paused": "paused",
+    "finishing": "finishing",
+    "finished": "finished",
+    "hash_checking": "hash_checking",
+    "seeding": "finished",
+    "filehosting_waiting": "waiting",
+    "extracting": "extracting",
+    "error": "error",
+}
+
 
 class SynologyDownloadClient:
-    """Клиент для работы с Synology Download Station."""
-    
-    def __init__(self):
-        """Инициализация клиента."""
-        self.ds = downloadstation.DownloadStation(
+    """Клиент Synology Download Station с автоматическим переподключением."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._last_auth_ts: float = 0.0
+        self.ds: Optional[downloadstation.DownloadStation] = None
+        self._authenticate()
+
+    def _create_client(self) -> downloadstation.DownloadStation:
+        """Создаёт новый клиент библиотеки с полностью свежей сессией.
+
+        Ключевой момент: сбрасываем class-level атрибут `BaseApi.shared_session`
+        в `None`, чтобы библиотека не переиспользовала мёртвую сессию, а
+        выполнила полноценный login.
+        """
+        BaseApi.shared_session = None
+        return downloadstation.DownloadStation(
             ip_address=SYNOLOGY_HOST,
-            port=str(SYNOLOGY_PORT),  # Преобразуем в строку как в тестовом скрипте
+            port=str(SYNOLOGY_PORT),
             username=SYNOLOGY_USERNAME,
             password=SYNOLOGY_PASSWORD,
             secure=SYNOLOGY_USE_HTTPS,
-            download_st_version=2  # Используем версию 2 API для поддержки create_task_torrent
+            download_st_version=2,
+            debug=False,
         )
-        # В библиотеке synology-api аутентификация происходит автоматически при первом вызове метода
-    
-    def _reauthenticate(self):
-        """Выполняет повторную аутентификацию при ошибке сессии."""
-        try:
-            logger.info("Выполняется повторная аутентификация...")
-            
-            # Пытаемся закрыть старую сессию, если есть метод logout
-            old_ds = self.ds
+
+    def _authenticate(self) -> None:
+        """Открывает новую сессию, аккуратно закрывая предыдущую."""
+        with self._lock:
+            if self.ds is not None:
+                try:
+                    self.ds.logout()
+                except SynoBaseException as exc:
+                    logger.debug("logout завершился с ошибкой (игнорируем): %s", exc)
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.debug("Неожиданная ошибка logout: %s", exc)
             try:
-                if hasattr(old_ds, 'session') and hasattr(old_ds.session, 'logout'):
-                    old_ds.session.logout()
-                    logger.debug("Старая сессия закрыта через logout")
-            except Exception as logout_error:
-                logger.debug(f"Не удалось закрыть старую сессию через logout: {logout_error}")
-            
-            # Явно удаляем старый объект для освобождения ресурсов
-            del old_ds
-            
-            # Пересоздаем клиент для получения новой сессии
-            self.ds = downloadstation.DownloadStation(
-                ip_address=SYNOLOGY_HOST,
-                port=str(SYNOLOGY_PORT),
-                username=SYNOLOGY_USERNAME,
-                password=SYNOLOGY_PASSWORD,
-                secure=SYNOLOGY_USE_HTTPS,
-                download_st_version=2
-            )
-            
-            # Выполняем тестовый запрос для аутентификации
-            # При первом вызове библиотека автоматически аутентифицируется
-            result = self.ds.get_info()
-            
-            # Проверяем, что запрос успешен (не ошибка 105 или 119)
-            if isinstance(result, dict):
-                error = result.get('error')
-                if error and isinstance(error, dict):
-                    error_code = error.get('code')
-                    if error_code in [105, 119]:
-                        logger.error(f"Ошибка при повторной аутентификации: код {error_code}")
-                        return False
-            
-            logger.info("Повторная аутентификация выполнена успешно")
-            return True
-        except DownloadStationError as e:
-            # Если это ошибка 105 или 119, значит переаутентификация не удалась
-            if hasattr(e, 'error_code') and e.error_code in [105, 119]:
-                logger.error(f"Ошибка при повторной аутентификации: код {e.error_code} - {e}")
-                return False
-            # Другие ошибки тоже считаем неудачей
-            logger.error(f"Ошибка при повторной аутентификации: {e}", exc_info=True)
-            return False
-        except Exception as e:
-            logger.error(f"Ошибка при повторной аутентификации: {e}", exc_info=True)
-            return False
-    
-    def _check_and_handle_error(self, result):
+                self.ds = self._create_client()
+                self._last_auth_ts = time.monotonic()
+                logger.info("Установлена новая сессия Synology Download Station")
+            except LoginError as exc:
+                logger.error("Ошибка авторизации Synology: %s", exc.error_message)
+                raise
+            except (SynoConnectionError, HTTPError) as exc:
+                logger.error(
+                    "Сетевая ошибка при авторизации Synology: %s",
+                    exc.error_message,
+                )
+                raise
+
+    def _ensure_session_fresh(self) -> None:
+        """Проактивно обновляет сессию, если она старше заданного интервала."""
+        if time.monotonic() - self._last_auth_ts <= SESSION_REFRESH_INTERVAL:
+            return
+        logger.info("Сессия Synology устарела, выполняется обновление")
+        try:
+            self._authenticate()
+        except SynoBaseException as exc:
+            # Не фатально: если сессия ещё жива, следующий вызов сработает.
+            logger.warning("Не удалось проактивно обновить сессию: %s", exc)
+
+    @staticmethod
+    def _extract_error(result: Any) -> tuple[bool, Optional[int], str]:
+        """Извлекает код и сообщение об ошибке из ответа API.
+
+        Возвращает: (is_error, error_code, error_message).
         """
-        Проверяет результат на наличие ошибок API и обрабатывает их.
-        
-        Returns:
-            tuple: (is_error, error_code, error_message) или (False, None, None) если ошибок нет
-        """
+        if isinstance(result, str):
+            # create_task_torrent возвращает строку при ошибке, содержащую код.
+            code: Optional[int] = None
+            for candidate in SESSION_ERROR_CODES | DESTINATION_ERROR_CODES:
+                if f"Ошибка API: {candidate}" in result:
+                    code = candidate
+                    break
+            return True, code, result
         if not isinstance(result, dict):
-            return (False, None, None)
-        
-        # Проверяем наличие ошибки в ответе
-        if 'error' in result:
-            error = result['error']
-            error_code = error.get('code') if isinstance(error, dict) else None
-            error_message = error.get('message', 'Неизвестная ошибка') if isinstance(error, dict) else str(error)
-            
-            # Если это ошибка сессии (119) или ошибка прав доступа (105), пытаемся переаутентифицироваться
-            # Ошибка 105 может возникать при использовании истекшей сессии
-            # Ошибка 106 (Invalid parameter) также может возникать при истекшей сессии при длительной работе
-            if error_code in [105, 106, 119]:
-                logger.warning(f"Обнаружена возможная ошибка сессии ({error_code}): {error_message}")
-                if self._reauthenticate():
-                    return ('retry', error_code, error_message)
-                else:
-                    return (True, error_code, f"{error_message} (не удалось переаутентифицироваться)")
-            
-            return (True, error_code, error_message)
-        
-        # Проверяем success флаг
-        if 'success' in result and not result.get('success'):
-            error_code = result.get('error', {}).get('code') if isinstance(result.get('error'), dict) else None
-            error_message = result.get('error', {}).get('message', 'Операция не выполнена') if isinstance(result.get('error'), dict) else 'Операция не выполнена'
-            
-            # Если это ошибка сессии (119) или ошибка прав доступа (105), пытаемся переаутентифицироваться
-            # Ошибка 106 (Invalid parameter) также может возникать при истекшей сессии при длительной работе
-            if error_code in [105, 106, 119]:
-                logger.warning(f"Обнаружена возможная ошибка сессии ({error_code}): {error_message}")
-                if self._reauthenticate():
-                    return ('retry', error_code, error_message)
-                else:
-                    return (True, error_code, f"{error_message} (не удалось переаутентифицироваться)")
-            
-            return (True, error_code, error_message)
-        
-        return (False, None, None)
-    
+            return False, None, ""
+        if result.get("success") is False or "error" in result:
+            err = result.get("error") or {}
+            if isinstance(err, dict):
+                return True, err.get("code"), err.get("message") or "Неизвестная ошибка"
+            return True, None, str(err)
+        return False, None, ""
+
+    @staticmethod
+    def _is_session_error(code: Optional[int], message: str) -> bool:
+        """Определяет, связана ли ошибка с невалидной сессией."""
+        if code in SESSION_ERROR_CODES:
+            return True
+        lowered = (message or "").lower()
+        return any(token in lowered for token in ("session", "sid", "not logged"))
+
+    def _call_api(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        """Вызывает метод клиента Download Station с ретраями по сессии/сети.
+
+        Args:
+            method_name: имя вызываемого метода библиотеки.
+            *args, **kwargs: аргументы для этого метода.
+
+        Returns:
+            Результат вызова (как у библиотеки).
+
+        Raises:
+            DownloadStationError / SynoConnectionError / HTTPError — если
+            все попытки исчерпаны.
+        """
+        self._ensure_session_fresh()
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, MAX_RETRIES + 2):
+            try:
+                with self._lock:
+                    method = getattr(self.ds, method_name)
+                    result = method(*args, **kwargs)
+                is_err, code, msg = self._extract_error(result)
+                if is_err and self._is_session_error(code, msg) and attempt <= MAX_RETRIES:
+                    logger.warning(
+                        "Ошибка сессии (code=%s, msg=%s); переавторизация, попытка %d",
+                        code, msg, attempt,
+                    )
+                    self._authenticate()
+                    continue
+                return result
+            except DownloadStationError as exc:
+                last_exc = exc
+                code = getattr(exc, "error_code", None)
+                if code in SESSION_ERROR_CODES and attempt <= MAX_RETRIES:
+                    logger.warning(
+                        "DownloadStationError code=%s; переавторизация, попытка %d",
+                        code, attempt,
+                    )
+                    self._authenticate()
+                    continue
+                raise
+            except (SynoConnectionError, HTTPError) as exc:
+                last_exc = exc
+                if attempt <= MAX_RETRIES:
+                    wait = 2 ** (attempt - 1)
+                    logger.warning(
+                        "Сетевая ошибка: %s; повтор через %d сек, попытка %d",
+                        getattr(exc, "error_message", exc), wait, attempt,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        return None
+
+    @staticmethod
+    def _extract_task_id(result: Any) -> Optional[str]:
+        """Извлекает task_id из ответа create_task / create_task_torrent."""
+        if not isinstance(result, dict):
+            return None
+        data = result.get("data", result)
+        if isinstance(data, dict):
+            task_id = data.get("taskid") or data.get("id")
+            if task_id:
+                return str(task_id)
+            task_ids = data.get("task_id")
+            if isinstance(task_ids, list) and task_ids:
+                return str(task_ids[0])
+            if task_ids:
+                return str(task_ids)
+        if isinstance(data, list) and data:
+            first = data[0]
+            if isinstance(first, dict):
+                tid = first.get("taskid") or first.get("id")
+                if tid:
+                    return str(tid)
+            return str(first)
+        return None
+
+    @contextmanager
+    def _torrent_file(self, torrent_data: bytes | str) -> Iterator[str]:
+        """Возвращает путь к торрент-файлу, создавая временный при необходимости."""
+        created_temp = False
+        path: Optional[str] = None
+        try:
+            if isinstance(torrent_data, (bytes, bytearray)):
+                if not torrent_data:
+                    raise ValueError("Пустые данные торрент-файла")
+                fd, path = tempfile.mkstemp(suffix=".torrent")
+                created_temp = True
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(torrent_data)
+                logger.debug(
+                    "Создан временный торрент-файл %s (%d байт)",
+                    path, len(torrent_data),
+                )
+            elif isinstance(torrent_data, str):
+                if not (os.path.exists(torrent_data) and os.path.isfile(torrent_data)):
+                    raise FileNotFoundError(f"Файл не найден: {torrent_data}")
+                path = torrent_data
+            else:
+                raise TypeError(f"Неподдерживаемый тип данных: {type(torrent_data)}")
+            if os.path.getsize(path) == 0:
+                raise ValueError(f"Файл пустой: {path}")
+            yield path
+        finally:
+            if created_temp and path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                    logger.debug("Удалён временный файл: %s", path)
+                except OSError as exc:
+                    logger.warning("Не удалось удалить %s: %s", path, exc)
+
     def add_torrent_file(
         self,
         torrent_data: bytes | str,
         destination_folder: str,
-        priority: str = "normal"
+        priority: str = "normal",
     ) -> Optional[str]:
-        """
-        Добавляет торрент-файл в Download Station.
-        
+        """Добавляет торрент-файл в Download Station.
+
         Args:
-            torrent_data: Содержимое торрент-файла в виде bytes или путь к файлу (str)
-            destination_folder: Папка назначения для загрузки
-            priority: Приоритет загрузки (low, normal, high)
-            
+            torrent_data: содержимое .torrent (bytes) или путь к файлу.
+            destination_folder: целевая папка на NAS.
+            priority: зарезервирован для совместимости интерфейса; библиотека
+                Synology не позволяет задать приоритет при создании задачи.
+
         Returns:
-            ID задачи загрузки или None при ошибке
+            task_id в виде строки или None при ошибке.
         """
-        torrent_file_path = None
-        
+        _ = priority  # сохраняем параметр для обратной совместимости
         try:
-            # Если передан путь к файлу, используем его напрямую
-            if isinstance(torrent_data, str):
-                if os.path.exists(torrent_data) and os.path.isfile(torrent_data):
-                    torrent_file_path = torrent_data
-                    logger.info(f"Используем существующий файл: {torrent_file_path}")
-                else:
-                    logger.error(f"Файл не найден: {torrent_data}")
-                    return None
-            elif isinstance(torrent_data, bytes):
-                # Если передан bytes, создаем временный файл в текущем каталоге
-                current_dir = os.getcwd()
-                with tempfile.NamedTemporaryFile(
-                    delete=False, 
-                    suffix='.torrent', 
-                    mode='wb',
-                    dir=current_dir
-                ) as tmp_file:
-                    tmp_file.write(torrent_data)
-                    torrent_file_path = tmp_file.name
-                    logger.debug(f"Создан временный торрент-файл: {torrent_file_path}, размер: {len(torrent_data)} байт")
-            else:
-                logger.error(f"Неподдерживаемый тип данных: {type(torrent_data)}")
-                return None
-            
-            # Проверяем, что файл существует и не пустой
-            if not os.path.exists(torrent_file_path):
-                logger.error(f"Файл не существует: {torrent_file_path}")
-                return None
-            
-            file_size = os.path.getsize(torrent_file_path)
-            if file_size == 0:
-                logger.error(f"Файл пустой: {torrent_file_path}")
-                return None
-            
-            logger.info(f"Загрузка торрента: файл={torrent_file_path}, размер={file_size} байт, destination={destination_folder}")
-            
-            # Используем новый метод для загрузки локального файла
-            result = self.ds.create_task_torrent(
-                file_path=str(torrent_file_path),
-                destination=destination_folder,
-                create_list=False
-            )
-            
-            logger.debug(f"Результат create_task_torrent: {result}")
-            
-            # Проверяем на наличие ошибок
-            is_error, error_code, error_message = self._check_and_handle_error(result)
-            
-            # Если ошибка сессии и удалось переаутентифицироваться, повторяем попытку
-            if is_error == 'retry':
-                logger.info("Повторная попытка после переаутентификации...")
-                result = self.ds.create_task_torrent(
-                    file_path=str(torrent_file_path),
-                    destination=destination_folder,
-                    create_list=False
+            with self._torrent_file(torrent_data) as path:
+                logger.info(
+                    "Загрузка торрента %s (%d байт) в %s",
+                    os.path.basename(path),
+                    os.path.getsize(path),
+                    destination_folder,
                 )
-                is_error, error_code, error_message = self._check_and_handle_error(result)
-                # Если после retry все еще ошибка 106, пробуем без destination
-                if is_error and is_error != 'retry' and error_code == 106:
-                    logger.warning(f"Ошибка 106 после переаутентификации, пробуем без destination...")
-                    try:
-                        result = self.ds.create_task_torrent(
-                            file_path=str(torrent_file_path),
-                            destination="",
-                            create_list=False
-                        )
-                        is_error, error_code, error_message = self._check_and_handle_error(result)
-                        if is_error:
-                            logger.error(
-                                f"Ошибка при создании задачи без destination: Ошибка API: {error_code} "
-                                f"Сообщение: {error_message}"
-                            )
-                            return None
-                        # Если успешно, продолжаем обработку ниже
-                    except Exception as e:
-                        logger.error(f"Ошибка при попытке загрузки без destination: {e}")
-                        return None
-            
-            # Если результат - строка, это может быть ошибка
-            if isinstance(result, str):
-                logger.error(f"Ошибка при создании задачи: {result}")
-                # Проверяем, не является ли это ошибкой сессии (105, 106 или 119)
-                # Ошибка 106 может возникать при истекшей сессии при длительной работе
-                if "105" in result or "106" in result or "119" in result or "SID" in result.upper() or "session" in result.lower():
-                    logger.warning("Возможная ошибка сессии, пытаемся переаутентифицироваться...")
-                    if self._reauthenticate():
-                        # Повторяем попытку
-                        result = self.ds.create_task_torrent(
-                            file_path=str(torrent_file_path),
-                            destination=destination_folder,
-                            create_list=False
-                        )
-                        is_error, error_code, error_message = self._check_and_handle_error(result)
-                        # Если после переаутентификации все еще ошибка, но не retry, обрабатываем дальше
-                        if is_error and is_error != 'retry':
-                            # Если это ошибка 106, пробуем без destination
-                            if error_code == 106:
-                                logger.warning(f"Ошибка 106 после переаутентификации, пробуем без destination...")
-                                try:
-                                    result = self.ds.create_task_torrent(
-                                        file_path=str(torrent_file_path),
-                                        destination="",
-                                        create_list=False
-                                    )
-                                    is_error, error_code, error_message = self._check_and_handle_error(result)
-                                    if is_error:
-                                        logger.error(
-                                            f"Ошибка при создании задачи без destination: Ошибка API: {error_code} "
-                                            f"Сообщение: {error_message}"
-                                        )
-                                        return None
-                                    # Если успешно, продолжаем обработку ниже
-                                except Exception as e:
-                                    logger.error(f"Ошибка при попытке загрузки без destination: {e}")
-                                    return None
-                            else:
-                                logger.error(
-                                    f"Ошибка при создании задачи после повторной попытки: "
-                                    f"Ошибка API: {error_code} (детали: {{'code': {error_code}}}) "
-                                    f"при скачивании торрента. Сообщение: {error_message}"
-                                )
-                                return None
-                        elif is_error == 'retry':
-                            # Еще одна попытка после retry
-                            logger.info("Повторная попытка после переаутентификации (второй раз)...")
-                            result = self.ds.create_task_torrent(
-                                file_path=str(torrent_file_path),
-                                destination=destination_folder,
-                                create_list=False
-                            )
-                            is_error, error_code, error_message = self._check_and_handle_error(result)
-                            if is_error:
-                                logger.error(
-                                    f"Ошибка при создании задачи после второй попытки: "
-                                    f"Ошибка API: {error_code} (детали: {{'code': {error_code}}}) "
-                                    f"при скачивании торрента. Сообщение: {error_message}"
-                                )
-                                return None
-                    else:
-                        return None
-                else:
-                    return None
-            
-            # Если есть ошибка, логируем и возвращаем None
-            if is_error:
-                # Ошибка 106 обычно означает "Invalid parameter"
-                # Но при длительной работе может возникать из-за истекшей сессии
-                # Если это не retry (т.е. переаутентификация не помогла), пробуем загрузить без destination
-                if error_code == 106 and is_error != 'retry':
-                    logger.warning(f"Ошибка 106 (Invalid parameter) при загрузке с destination={destination_folder}")
-                    logger.info("Пробуем загрузить без указания destination...")
-                    try:
-                        result = self.ds.create_task_torrent(
-                            file_path=str(torrent_file_path),
-                            destination="",  # Пустой destination
-                            create_list=False
-                        )
-                        logger.debug(f"Результат create_task_torrent без destination: {result}")
-                        is_error, error_code, error_message = self._check_and_handle_error(result)
-                        if not is_error:
-                            logger.info("Успешно загружено без указания destination")
-                            # Продолжаем обработку успешного результата ниже
-                        else:
-                            logger.error(
-                                f"Ошибка при создании задачи без destination: Ошибка API: {error_code} "
-                                f"Сообщение: {error_message}"
-                            )
-                            return None
-                    except Exception as e:
-                        logger.error(f"Ошибка при попытке загрузки без destination: {e}")
-                        return None
-                elif is_error != 'retry':
+                result = self._call_api(
+                    "create_task_torrent",
+                    file_path=path,
+                    destination=destination_folder,
+                    create_list=False,
+                )
+                is_err, code, msg = self._extract_error(result)
+                if is_err and code in DESTINATION_ERROR_CODES:
+                    logger.warning(
+                        "Ошибка destination (code=%s msg=%s); "
+                        "повтор без указания destination",
+                        code, msg,
+                    )
+                    result = self._call_api(
+                        "create_task_torrent",
+                        file_path=path,
+                        destination="",
+                        create_list=False,
+                    )
+                    is_err, code, msg = self._extract_error(result)
+                if is_err:
                     logger.error(
-                        f"Ошибка при создании задачи: Ошибка API: {error_code} "
-                        f"(детали: {{'code': {error_code}}}) при скачивании торрента. "
-                        f"Сообщение: {error_message}"
+                        "Не удалось создать задачу: code=%s msg=%s",
+                        code, msg,
                     )
                     return None
-                # Если is_error == 'retry', значит переаутентификация прошла успешно, но запрос еще не повторен
-                # Это обрабатывается выше в коде
-            
-            # Обрабатываем успешный результат
-            if result and isinstance(result, dict):
-                # Извлекаем task_id из ответа
-                task_id = None
-                if 'data' in result:
-                    data = result['data']
-                    if isinstance(data, dict):
-                        # Проверяем taskid или task_id
-                        if 'taskid' in data:
-                            task_id = data['taskid']
-                        elif 'task_id' in data:
-                            # task_id может быть списком
-                            task_id_list = data['task_id']
-                            if isinstance(task_id_list, list) and len(task_id_list) > 0:
-                                task_id = task_id_list[0]
-                            else:
-                                task_id = task_id_list
-                    elif isinstance(data, list) and len(data) > 0:
-                        task_id = data[0].get('taskid') if isinstance(data[0], dict) else data[0]
-                elif 'taskid' in result:
-                    task_id = result['taskid']
-                
-                if task_id:
-                    # Устанавливаем приоритет если поддерживается
-                    if priority != "normal":
-                        try:
-                            # Попытка установить приоритет через edit_task или другой метод
-                            pass  # Приоритет может не поддерживаться API
-                        except Exception:
-                            pass
-                    
-                    # Удаляем файл только при успешной отправке
-                    if torrent_file_path and os.path.exists(torrent_file_path):
-                        try:
-                            os.unlink(torrent_file_path)
-                            logger.debug(f"Удален торрент-файл после успешной отправки: {torrent_file_path}")
-                        except Exception as e:
-                            logger.warning(f"Не удалось удалить файл {torrent_file_path}: {e}")
-                    
-                    return str(task_id)
-                else:
-                    logger.warning(f"Не удалось извлечь task_id из ответа: {result}")
-                    return None
-            else:
-                logger.warning(f"Неожиданный тип результата: {type(result)}, значение: {result}")
-                return None
-                    
-        except Exception as e:
-            logger.error(f"Ошибка при добавлении торрента в Download Station: {e}", exc_info=True)
+                task_id = self._extract_task_id(result)
+                if task_id is None:
+                    logger.warning("Не удалось извлечь task_id из ответа: %s", result)
+                return task_id
+        except (FileNotFoundError, ValueError, TypeError) as exc:
+            logger.error("Ошибка подготовки торрент-файла: %s", exc)
             return None
-    
+        except DownloadStationError as exc:
+            logger.error("DownloadStationError: %s", exc.error_message)
+            return None
+        except (SynoConnectionError, HTTPError) as exc:
+            logger.error(
+                "Сетевая ошибка при загрузке торрента: %s",
+                getattr(exc, "error_message", exc),
+            )
+            return None
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Ошибка при добавлении торрента: %s", exc, exc_info=True)
+            return None
+
     def add_torrent_by_id(
         self,
         torrent_id: str,
         resolution: int,
-        priority: str = "normal"
+        priority: str = "normal",
     ) -> Optional[str]:
-        """
-        Добавляет торрент в Download Station по ID из RuTracker.
-        
-        Args:
-            torrent_id: ID торрента на RuTracker
-            resolution: Разрешение (1080 или 2160)
-            priority: Приоритет загрузки
-            
-        Returns:
-            ID задачи загрузки или None при ошибке
-        """
+        """Добавляет торрент в Download Station по ID c RuTracker."""
+        _ = priority  # интерфейс сохранён; приоритет DS API не поддерживает
+        destination = (
+            DOWNLOAD_STATION_FOLDER_2160
+            if resolution == 2160
+            else DOWNLOAD_STATION_FOLDER_1080
+        )
+        torrent_url = f"https://rutracker.org/forum/dl.php?t={torrent_id}"
         try:
-            # Определяем папку назначения в зависимости от разрешения
-            if resolution == 2160:
-                destination = DOWNLOAD_STATION_FOLDER_2160
-            else:
-                destination = DOWNLOAD_STATION_FOLDER_1080
-            
-            # Используем URL торрента напрямую
-            torrent_url = f"https://rutracker.org/forum/dl.php?t={torrent_id}"
-            
-            result = self.ds.create_task(
-                url=torrent_url,
-                destination=destination
+            result = self._call_api(
+                "create_task", url=torrent_url, destination=destination,
             )
-            
-            # Проверяем на наличие ошибок
-            is_error, error_code, error_message = self._check_and_handle_error(result)
-            
-            # Если ошибка сессии и удалось переаутентифицироваться, повторяем попытку
-            if is_error == 'retry':
-                logger.info("Повторная попытка после переаутентификации...")
-                result = self.ds.create_task(
-                    url=torrent_url,
-                    destination=destination
-                )
-                is_error, error_code, error_message = self._check_and_handle_error(result)
-            
-            # Если есть ошибка, логируем и возвращаем None
-            if is_error:
-                logger.error(
-                    f"Ошибка при создании задачи: Ошибка API: {error_code} "
-                    f"(детали: {{'code': {error_code}}}) при скачивании торрента. "
-                    f"Сообщение: {error_message}"
-                )
+            is_err, code, msg = self._extract_error(result)
+            if is_err:
+                logger.error("Ошибка create_task: code=%s msg=%s", code, msg)
                 return None
-            
-            if result:
-                # В зависимости от API может быть разная структура ответа
-                if isinstance(result, dict):
-                    task_id = result.get('taskid') or result.get('id')
-                elif isinstance(result, list) and len(result) > 0:
-                    task_id = result[0].get('taskid') or result[0].get('id')
-                else:
-                    task_id = result
-                
-                if task_id:
-                    if priority != "normal":
-                        try:
-                            self.ds.set_config(
-                                taskid=task_id,
-                                priority=priority
-                            )
-                        except Exception:
-                            pass
-                    return str(task_id)
-            
+            return self._extract_task_id(result)
+        except DownloadStationError as exc:
+            logger.error("DownloadStationError: %s", exc.error_message)
             return None
-        except Exception as e:
-            logger.error(f"Ошибка при добавлении торрента в Download Station: {e}", exc_info=True)
+        except (SynoConnectionError, HTTPError) as exc:
+            logger.error(
+                "Сетевая ошибка: %s", getattr(exc, "error_message", exc),
+            )
             return None
-    
-    def get_task_status(self, task_id: str) -> Optional[dict]:
-        """
-        Получает статус задачи загрузки.
-        
-        Args:
-            task_id: ID задачи загрузки
-            
-        Returns:
-            Словарь с информацией о задаче или None при ошибке
-            Структура ответа:
-            {
-                'status': 'downloading' | 'finished' | 'error' | 'waiting' | 'paused' | 'finishing' | 'hash_checking',
-                'title': str,  # название задачи
-                'error': str | None  # сообщение об ошибке если есть
-            }
-        """
-        max_retries = 2
-        retry_count = 0
-        result = None
-        
-        while retry_count <= max_retries:
-            try:
-                # Используем tasks_list для получения всех задач и ищем нужную по ID
-                logger.debug(f"Получение статуса задачи {task_id} (попытка {retry_count + 1})")
-                result = self.ds.tasks_list(
-                    additional_param=['detail']
-                )
-                
-                # Проверяем на наличие ошибок
-                is_error, error_code, error_message = self._check_and_handle_error(result)
-                
-                if is_error == 'retry':
-                    logger.info("Повторная попытка получения статуса после переаутентификации...")
-                    result = self.ds.tasks_list(
-                        additional_param=['detail']
-                    )
-                    is_error, error_code, error_message = self._check_and_handle_error(result)
-                
-                if is_error:
-                    logger.error(f"Ошибка при получении статуса задачи {task_id}: {error_code} - {error_message}")
-                    return None
-                
-                # Если успешно получили результат, выходим из цикла
-                break
-                
-            except DownloadStationError as e:
-                # Если это ошибка сессии (105 или 119), пытаемся переаутентифицироваться
-                if hasattr(e, 'error_code') and e.error_code in [105, 119]:
-                    logger.warning(f"Ошибка сессии ({e.error_code}) при получении статуса задачи {task_id}, пытаемся переаутентифицироваться...")
-                    if self._reauthenticate() and retry_count < max_retries:
-                        retry_count += 1
-                        continue  # Повторяем попытку
-                    else:
-                        logger.error(f"Не удалось переаутентифицироваться или превышено количество попыток при получении статуса задачи {task_id}")
-                        return None
-                else:
-                    logger.error(f"DownloadStationError при получении статуса задачи {task_id}: {e.error_code} - {e}")
-                    return None
-            except Exception as e:
-                logger.error(f"Ошибка при получении статуса задачи {task_id}: {e}", exc_info=True)
-                return None
-        
-        # Если мы дошли сюда, значит не удалось получить результат после всех попыток
-        if result is None:
-            logger.error(f"Не удалось получить результат для задачи {task_id} после всех попыток")
-            return None
-        
-        # Продолжаем обработку успешного результата
-        try:
-            # Проверяем структуру ответа
-            if not isinstance(result, dict):
-                logger.warning(f"Неожиданный тип ответа для задачи {task_id}: {type(result)}, значение: {result}")
-                return None
-            
-            if 'data' not in result:
-                logger.warning(f"Отсутствует ключ 'data' в ответе для задачи {task_id}: {result}")
-                return None
-            
-            # Извлекаем список задач из ответа tasks_list
-            data = result.get('data', {})
-            tasks = data.get('task', []) or data.get('tasks', [])
-            
-            # Проверяем, что tasks - это список
-            if not isinstance(tasks, list):
-                logger.warning(f"Неожиданный тип списка задач для задачи {task_id}: {type(tasks)}, значение: {tasks}")
-                return None
-            
-            if len(tasks) == 0:
-                logger.debug(f"Список задач пуст для задачи {task_id}")
-                return None
-            
-            logger.debug(f"Найдено задач в списке: {len(tasks)}")
-            
-            # Ищем нужную задачу по ID
-            task = None
-            for t in tasks:
-                if not isinstance(t, dict):
-                    continue
-                task_id_from_list = t.get('id')
-                # Сравниваем как строки для надежности
-                if str(task_id_from_list) == str(task_id):
-                    task = t
-                    logger.debug(f"Задача {task_id} найдена в списке")
-                    break
-            
-            if not task:
-                logger.warning(f"Задача {task_id} не найдена в списке задач (всего задач: {len(tasks)})")
-                # Логируем доступные ID для отладки
-                available_ids = [str(t.get('id', 'N/A')) for t in tasks[:5] if isinstance(t, dict)]
-                logger.debug(f"Доступные ID задач (первые 5): {available_ids}")
-                return None
-            
-            # Извлекаем информацию о статусе
-            # Статус может быть числом или строкой
-            task_status = task.get('status')
-            
-            # Маппинг числовых статусов DownloadStation
-            # Согласно документации и реальным данным:
-            # 0 = waiting, 1 = downloading, 2 = paused, 3 = finishing, 4 = finished, 
-            # 5 = error, 6 = seeding, 7 = hash_checking, 8 = downloading (альтернативный код)
-            numeric_status_map = {
-                1: 'waiting',
-                2: 'downloading',
-                3: 'paused',
-                4: 'finishing',
-                5: 'finished',
-                6: 'error',
-                7: 'finished',  # seeding считается завершенным
-                8: 'finished',
-                9: 'downloading',  # Альтернативный код для downloading
-            }
-            
-            # Маппинг строковых статусов (согласно документации)
-            string_status_map = {
-                'waiting': 'waiting',
-                'downloading': 'downloading',
-                'paused': 'paused',
-                'finishing': 'finishing',
-                'finished': 'finished',
-                'hash_checking': 'hash_checking',
-                'seeding': 'finished',  # seeding считается завершенным
-                'filehosting_waiting': 'waiting',
-                'extracting': 'extracting',
-                'error': 'error',
-            }
-            
-            # Определяем статус
-            if isinstance(task_status, (int, float)):
-                status = numeric_status_map.get(int(task_status), 'unknown')
-            elif isinstance(task_status, str):
-                status = string_status_map.get(task_status.lower(), 'unknown')
-            else:
-                status = 'unknown'
-                logger.warning(f"Неизвестный тип статуса для задачи {task_id}: {type(task_status)}, значение: {task_status}")
-            
-            # Получаем информацию об ошибке
-            additional = task.get('additional', {})
-            if not isinstance(additional, dict):
-                additional = {}
-            
-            error_detail = None
-            if status == 'error':
-                error_detail = (
-                    task.get('error_detail') or
-                    task.get('error_message') or
-                    additional.get('detail', {}).get('error_detail') if isinstance(additional.get('detail'), dict) else None
-                )
-            
-            result_dict = {
-                'status': status,
-                'title': task.get('title', ''),
-                'error': error_detail
-            }
-            
-            logger.debug(f"Статус задачи {task_id}: {status}, название: {task.get('title', 'N/A')}")
-            return result_dict
-        except Exception as e:
-            logger.error(f"Ошибка при обработке результата для задачи {task_id}: {e}", exc_info=True)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Ошибка при добавлении торрента: %s", exc, exc_info=True)
             return None
 
+    def get_task_status(self, task_id: str) -> Optional[dict]:
+        """Возвращает статус задачи по ID.
+
+        Returns:
+            Словарь {'status', 'title', 'error'} либо None при ошибке.
+        """
+        try:
+            result = self._call_api("tasks_list", additional_param=["detail"])
+        except DownloadStationError as exc:
+            logger.error(
+                "Не удалось получить список задач (task %s): %s",
+                task_id, exc.error_message,
+            )
+            return None
+        except (SynoConnectionError, HTTPError) as exc:
+            logger.error(
+                "Сетевая ошибка при получении списка задач (task %s): %s",
+                task_id, getattr(exc, "error_message", exc),
+            )
+            return None
+        is_err, code, msg = self._extract_error(result)
+        if is_err:
+            logger.error(
+                "Ошибка tasks_list: code=%s msg=%s", code, msg,
+            )
+            return None
+        if not isinstance(result, dict):
+            logger.warning("Неожиданный тип ответа tasks_list: %s", type(result))
+            return None
+        data = result.get("data") or {}
+        tasks = data.get("task") or data.get("tasks") or []
+        if not isinstance(tasks, list):
+            logger.warning("Некорректный формат списка задач: %s", type(tasks))
+            return None
+        task = next(
+            (t for t in tasks if isinstance(t, dict) and str(t.get("id")) == str(task_id)),
+            None,
+        )
+        if task is None:
+            logger.debug(
+                "Задача %s не найдена (всего задач: %d)", task_id, len(tasks),
+            )
+            return None
+        return self._parse_task_status(task, task_id)
+
+    @staticmethod
+    def _parse_task_status(task: dict, task_id: str) -> dict:
+        """Преобразует запись задачи в унифицированный словарь статуса."""
+        raw_status = task.get("status")
+        if isinstance(raw_status, (int, float)):
+            status = _NUMERIC_STATUS_MAP.get(int(raw_status), "unknown")
+        elif isinstance(raw_status, str):
+            status = _STRING_STATUS_MAP.get(raw_status.lower(), "unknown")
+        else:
+            status = "unknown"
+            logger.debug(
+                "Неизвестный тип статуса у задачи %s: %r", task_id, raw_status,
+            )
+        error_detail: Optional[str] = None
+        if status == "error":
+            additional = task.get("additional") or {}
+            detail = additional.get("detail") if isinstance(additional, dict) else None
+            error_detail = (
+                task.get("error_detail")
+                or task.get("error_message")
+                or (detail.get("error_detail") if isinstance(detail, dict) else None)
+            )
+        return {
+            "status": status,
+            "title": task.get("title", ""),
+            "error": error_detail,
+        }
+
+    def close(self) -> None:
+        """Завершает сессию и освобождает ресурсы."""
+        with self._lock:
+            if self.ds is None:
+                return
+            try:
+                self.ds.logout()
+                logger.info("Сессия Synology закрыта")
+            except SynoBaseException as exc:
+                logger.debug("Ошибка logout игнорирована: %s", exc)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Неожиданная ошибка logout: %s", exc)
+            finally:
+                self.ds = None
+                BaseApi.shared_session = None

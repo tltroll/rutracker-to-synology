@@ -10,13 +10,19 @@ if env_path.exists():
 
 # Telegram Bot
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')  # Опционально: URL для webhook (если не задан, используется polling)
+# Опционально: URL для webhook (если не задан, используется polling)
+WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')
 
 # Rutracker
 RUTRACKER_LOGIN = os.getenv('RUTRACKER_LOGIN', '')
 RUTRACKER_PASSWORD = os.getenv('RUTRACKER_PASSWORD', '')
 RUTRACKER_PROXY = os.getenv('RUTRACKER_PROXY', '')  # Опционально: http://proxy_ip:port
 RUTRACKER_USER_AGENT = os.getenv('RUTRACKER_USER_AGENT', '')  # Опционально: кастомный User-Agent
+
+# Rutracker - параметры поиска и фильтрации
+RUTRACKER_MAX_PAGES = int(os.getenv('RUTRACKER_MAX_PAGES', '2'))
+RUTRACKER_SEARCH_CACHE_TTL = int(os.getenv('RUTRACKER_SEARCH_CACHE_TTL', '300'))
+RUTRACKER_MIN_SEEDERS = int(os.getenv('RUTRACKER_MIN_SEEDERS', '1'))
 
 # Kinopub (не требует авторизации для поиска)
 
@@ -56,11 +62,11 @@ def validate_config():
     for var in REQUIRED_VARS:
         if not os.getenv(var):
             missing_vars.append(var)
-    
+
     if missing_vars:
         raise ValueError(
             f"Отсутствуют обязательные переменные окружения: {', '.join(missing_vars)}"
         )
-    
+
     return True
 
