@@ -1,277 +1,247 @@
 # Download Films Bot
 
-A Telegram bot for searching and downloading movies and TV series from RuTracker and Kinopub, with automatic integration to Synology Download Station.
+Телеграм-бот для поиска фильмов и сериалов на RuTracker с автоматической
+постановкой раздач в очередь Synology Download Station. Для подсказок и
+постеров используется открытое API Kinopub.
 
-[![GitHub](https://img.shields.io/badge/GitHub-Repository-blue)](https://github.com/tltroll/rutracker-to-synology)
+Написан на `aiogram 3.x` + `aiohttp`. Работает как в polling, так и в webhook
+режиме, разворачивается в Docker.
 
-## Features
+## Возможности
 
-### 🔍 Search Capabilities
-- **Kinopub Integration**: Search movies and TV series via inline mode with poster previews
-- **RuTracker Integration**: Search and download torrents from RuTracker tracker
-- **Smart Filtering**: Automatic filtering and prioritization of results by:
-  - Resolution (1080p, 2160p/4K)
-  - HDR/DV support
-  - Quality indicators
-  - Content type (movies vs TV series)
+- **Inline-поиск по Kinopub** — пишете `@имя_бота название` прямо в любом чате,
+  бот подсказывает фильмы и сериалы с постерами. При выборе результата
+  название отправляется в ваш чат, и бот сразу же ищет раздачи на RuTracker.
+- **Поиск на RuTracker** — можно просто отправить название фильма в личку боту.
+  Клиент переиспользует одну авторизованную сессию и кеширует результаты.
+- **Умная фильтрация и приоритизация** раздач:
+  - отсекаются Blu-ray Disc образы;
+  - для фильмов — отсев по году (±1 год от года из Kinopub);
+  - отсев «мёртвых» раздач по минимуму сидеров;
+  - сортировка по разрешению (2160p > 1080p), затем по типу источника
+    (BDRemux > WEB-DL > Rip), затем по меткам (Hybrid > DV > HDR) и числу
+    сидеров.
+- **Разный рендер для фильмов и сериалов**:
+  - фильмам приоритет отдаётся 4K DV/HDR с добавкой 1080p BDRemux как
+    альтернатива;
+  - для сериалов одновременно показываются 4K и 1080p, чтобы были видны
+    все сезоны.
+- **Автоматическая раскладка по папкам Synology**:
+  - `DOWNLOAD_STATION_FOLDER_2160` — для 4K раздач фильмов;
+  - `DOWNLOAD_STATION_FOLDER_1080` — для остальных фильмов;
+  - `DOWNLOAD_STATION_FOLDER_SERIAL` — для сериалов (вне зависимости от
+    разрешения).
+- **Мониторинг задач** — после постановки раздачи бот раз в минуту проверяет
+  статус через Download Station API и присылает сообщение, когда загрузка
+  завершилась или упала с ошибкой.
+- **Устойчивость к обрывам сессий** — у клиентов RuTracker и Synology
+  реализован автологин при `401`, таймауте или кодах сессии Synology
+  (105/106/107/117/118/119). Сессия Synology дополнительно обновляется
+  каждые 30 минут.
+- **Контроль доступа** — если указан `ALLOWED_USER_IDS`, бот отвечает только
+  пользователям из этого списка.
 
-### 📥 Download Management
-- **Automatic Download**: Downloads torrent files and adds them to Synology Download Station
-- **Smart Folder Organization**: Automatically sorts downloads into folders:
-  - `/downloads/1080p` - for 1080p movies
-  - `/downloads/2160p` - for 4K/UHD movies
-  - `/downloads/serials` - for TV series (all resolutions)
-- **Download Monitoring**: Real-time monitoring of download status with automatic notifications
-- **High Priority Downloads**: All downloads are set to high priority in Download Station
+## Требования
 
-### 🎬 Content Support
-- **Movies**: Full support with year detection and resolution filtering
-- **TV Series**: Special handling for series (year removal from search queries)
-- **Metadata Extraction**: Automatic extraction of:
-  - Movie/series name
-  - Release year
-  - Resolution (1080p, 2160p)
-  - HDR/DV indicators
+- Python 3.13 (в Docker используется `python:3.13-alpine`).
+- Synology NAS с установленным Download Station (протестировано с DSM 7).
+- Аккаунт на RuTracker.
+- Telegram Bot Token от [@BotFather](https://t.me/BotFather) с включённым
+  inline-режимом.
 
-### 🔐 Security & Access Control
-- **User Access Control**: Restrict bot access to specific Telegram user IDs
-- **Secure Configuration**: Environment-based configuration with `.env` file support
+## Установка
 
-### 🚀 Deployment Options
-- **Polling Mode**: Default mode for development and simple deployments
-- **Webhook Mode**: Production-ready webhook support for scalable deployments
-- **Docker Support**: Full Docker containerization with docker-compose
-
-## Requirements
-
-- Python 3.13+
-- Synology NAS with Download Station installed
-- RuTracker account
-- Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
-
-## Installation
-
-### 1. Clone the repository
+### 1. Клонирование и виртуальное окружение
 
 ```bash
 git clone https://github.com/tltroll/rutracker-to-synology.git
 cd rutracker-to-synology
+
+python3.13 -m venv .venv
+source .venv/bin/activate
 ```
 
-### 2. Install dependencies
+### 2. Установка зависимостей
 
 ```bash
 pip install -r requirements.txt
-pip install py-rutracker-client==0.2.0
+pip install py-rutracker-client==0.2.0 --no-deps
 ```
 
-### 3. Configure Telegram Bot
+`py-rutracker-client` принципиально ставится с `--no-deps`: библиотека требует
+`aiohttp>=3.13.2`, а `aiogram 3.22` пока совместима только с `aiohttp==3.12.x`.
+Функциональность от этого не страдает.
 
-Before using the bot, you need to enable inline mode in BotFather:
+### 3. Включение inline-режима у бота
 
-1. Open [@BotFather](https://t.me/BotFather) in Telegram
-2. Send `/mybots` command
-3. Select your bot
-4. Choose "Bot Settings" → "Inline Mode"
-5. Enable inline mode
+1. Откройте [@BotFather](https://t.me/BotFather).
+2. `/mybots` → выберите бота → **Bot Settings** → **Inline Mode** → **Turn on**.
 
-This is required for the inline search feature (Kinopub integration) to work.
+Без этого inline-поиск по Kinopub работать не будет.
 
-### 4. Configure environment variables
+### 4. Конфигурация
 
-Copy `env.example` to `.env` and fill in your credentials:
+Скопируйте шаблон и заполните его:
 
 ```bash
 cp env.example .env
 ```
 
-Edit `.env` with your settings:
+Переменные окружения описаны ниже, в разделе
+[Конфигурация](#конфигурация).
 
-```env
-# Telegram Bot
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
-WEBHOOK_URL=  # Optional: for webhook mode
-
-# Rutracker
-RUTRACKER_LOGIN=your_rutracker_login
-RUTRACKER_PASSWORD=your_rutracker_password
-RUTRACKER_PROXY=  # Optional: http://proxy_ip:port
-RUTRACKER_USER_AGENT=  # Optional: custom User-Agent
-
-# Synology NAS
-SYNOLOGY_HOST=192.168.1.100
-SYNOLOGY_PORT=5000
-SYNOLOGY_USERNAME=your_synology_username
-SYNOLOGY_PASSWORD=your_synology_password
-SYNOLOGY_USE_HTTPS=False
-
-# Download Station folders
-DOWNLOAD_STATION_FOLDER_1080=/downloads/1080p
-DOWNLOAD_STATION_FOLDER_2160=/downloads/2160p
-DOWNLOAD_STATION_FOLDER_SERIAL=/downloads/serials
-
-# Allowed users (comma-separated Telegram user IDs)
-ALLOWED_USER_IDS=123456789,987654321
-```
-
-### 5. Run the bot
+### 5. Запуск
 
 ```bash
 python bot.py
 ```
 
-## Docker Deployment
+При первом запуске бот проверит обязательные переменные и упадёт с
+понятной ошибкой, если что-то не задано.
 
-### Using Docker Compose
+## Использование
 
-1. Edit `docker-compose.yml` and set your environment variables
+### Inline-поиск (Kinopub)
 
-2. Build and run:
+1. В любом чате начните вводить `@имя_бота Название`.
+2. Telegram покажет выпадающий список с постерами и пометкой «Фильм» или
+   «Сериал».
+3. Выбираете нужный — бот отправит сообщение с названием и сразу же начнёт
+   поиск на RuTracker, учитывая год (для фильмов) и тип контента.
+
+### Прямой поиск (RuTracker)
+
+1. Отправьте боту в личку название фильма или сериала.
+2. Бот вернёт до 15 отфильтрованных раздач. Для каждой показывается:
+   название, год, разрешение (`HD`/`4K`), метки `HDR`/`DV` и размер.
+3. Выберите раздачу — появится карточка с подробностями и кнопка
+   «Скачать».
+4. После нажатия «Скачать» бот положит раздачу в соответствующую папку
+   Synology и начнёт следить за её статусом.
+
+### Команды
+
+- `/start` — приветствие и кнопка для запуска inline-поиска.
+
+## Конфигурация
+
+Все настройки передаются через переменные окружения (или `.env`). Полный
+пример лежит в `env.example`.
+
+### Обязательные
+
+| Переменная | Описание |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Токен бота от BotFather |
+| `RUTRACKER_LOGIN` | Логин на RuTracker |
+| `RUTRACKER_PASSWORD` | Пароль от RuTracker |
+| `SYNOLOGY_HOST` | IP или hostname NAS |
+| `SYNOLOGY_USERNAME` | Пользователь Synology с доступом к Download Station |
+| `SYNOLOGY_PASSWORD` | Его пароль |
+
+### Опциональные
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `WEBHOOK_URL` | — | Если задан, бот работает в режиме webhook (слушает порт `8000`). Иначе — polling. |
+| `RUTRACKER_PROXY` | — | HTTP-прокси для RuTracker, например `http://127.0.0.1:8080`. |
+| `RUTRACKER_USER_AGENT` | — | Пользовательский User-Agent для обхода блокировок. |
+| `RUTRACKER_MAX_PAGES` | `2` | Сколько страниц результатов загружать (на странице ~50 раздач). |
+| `RUTRACKER_SEARCH_CACHE_TTL` | `300` | Время жизни кеша поисковых запросов (секунд). `0` — выключить кеш. |
+| `RUTRACKER_MIN_SEEDERS` | `1` | Минимум сидеров для показа раздачи. `0` — не фильтровать. |
+| `SYNOLOGY_PORT` | `5000` | Порт DSM. |
+| `SYNOLOGY_USE_HTTPS` | `False` | Использовать HTTPS при обращении к DSM. |
+| `DOWNLOAD_STATION_FOLDER_1080` | `/downloads/1080p` | Папка для 1080p фильмов. |
+| `DOWNLOAD_STATION_FOLDER_2160` | `/downloads/2160p` | Папка для 4K фильмов. |
+| `DOWNLOAD_STATION_FOLDER_SERIAL` | `/downloads/serials` | Папка для сериалов. |
+| `ALLOWED_USER_IDS` | — | Список Telegram ID через запятую. Если пусто — доступ открыт всем. |
+
+## Docker
+
+### Через docker-compose
+
+1. Отредактируйте `docker-compose.yml`, подставьте свои значения в секцию
+   `environment` (либо замените её на `env_file: .env`).
+2. Запустите:
 
 ```bash
 docker-compose up -d
 ```
 
-### Using Docker directly
+### Через docker напрямую
 
 ```bash
 docker build -t download-films-bot .
-docker run -d --env-file .env download-films-bot
+docker run -d --env-file .env --name films-bot download-films-bot
 ```
 
-## Usage
+Образ основан на `python:3.13-alpine`. В процессе сборки применяется локальный
+патч `patches/synology_api/downloadstation.py` поверх установленной
+`synology-api` — он нужен для корректной работы `create_task_torrent` в
+Download Station API v2.
 
-### Inline Search (Kinopub)
-
-1. Start a chat with the bot
-2. Type `@your_bot_name` followed by a movie/series name
-3. Select from the results with posters
-4. The bot will automatically search RuTracker and show torrent options
-
-### Direct Search (RuTracker)
-
-1. Simply type a movie name in the chat
-2. The bot will automatically search RuTracker and show filtered results
-3. Select a torrent to view details
-4. Click "Download" to start the download
-
-### Commands
-
-- `/start` - Show welcome message and bot information
-
-## How It Works
-
-1. **Search Flow**:
-   - User searches via inline mode (Kinopub) or types movie name directly (RuTracker)
-   - Bot searches Kinopub for movie metadata with posters
-   - Bot searches RuTracker for torrent files
-   - Results are filtered and prioritized by quality
-
-2. **Download Flow**:
-   - User selects a torrent
-   - Bot downloads the `.torrent` file
-   - Bot adds torrent to Synology Download Station
-   - Bot monitors download progress
-   - User receives notification when download completes
-
-3. **Smart Filtering**:
-   - Extracts resolution, year, and quality indicators
-   - Prioritizes higher quality releases
-   - Filters out low-quality or duplicate results
-   - Shows up to 15 best results
-
-## Project Structure
+## Архитектура
 
 ```
-rutracker-to-synology/
-├── bot.py                 # Main bot file with handlers
-├── config.py              # Configuration management
-├── rutracker_client.py    # RuTracker API client
-├── kinopub_client.py      # Kinopub API client
-├── synology_client.py     # Synology Download Station client
-├── utils.py               # Utility functions (filtering, parsing)
-├── patches/               # Patches for synology_api library
+download_films_bot/
+├── bot.py                 # хендлеры aiogram, FSM, мониторинг задач
+├── config.py              # чтение .env и валидация обязательных переменных
+├── rutracker_client.py    # обёртка над py-rutracker-client с кешем и ретраями
+├── kinopub_client.py      # клиент Kinopub для автодополнения и постеров
+├── synology_client.py     # клиент Download Station с авто-переавторизацией
+├── utils.py               # парсинг названий, приоритизация и фильтрация
+├── patches/               # локальные патчи для сторонних библиотек
 │   └── synology_api/
 │       └── downloadstation.py
-├── docker-compose.yml     # Docker Compose configuration
-├── Dockerfile             # Docker image definition
-├── requirements.txt       # Python dependencies
-├── env.example            # Environment variables template
-└── README.md              # This file
+├── requirements.txt
+├── env.example
+├── Dockerfile
+└── docker-compose.yml
 ```
 
-## Configuration Details
+### Поток данных
 
-### Required Variables
+1. Пользователь вводит запрос через inline или пишет в личку.
+2. Для inline-поиска бот запрашивает автодополнение у Kinopub и показывает
+   до 20 результатов с постерами.
+3. После выбора (или при прямом текстовом запросе) бот:
+   - нормализует запрос (для сериалов срезает год);
+   - делает поиск на RuTracker (`RUTRACKER_MAX_PAGES` страниц);
+   - применяет фильтр по году (для фильмов), минимуму сидеров и
+     приоритизацию по качеству;
+   - показывает до 15 лучших раздач с постером (если есть `kinopub_id`).
+4. При выборе раздачи бот скачивает `.torrent`, кладёт его через
+   Download Station API в нужную папку и начинает следить за задачей.
+5. По завершении или ошибке бот редактирует исходное сообщение.
 
-- `TELEGRAM_BOT_TOKEN` - Your Telegram bot token
-- `RUTRACKER_LOGIN` - RuTracker account login
-- `RUTRACKER_PASSWORD` - RuTracker account password
-- `SYNOLOGY_HOST` - Synology NAS IP address or hostname
-- `SYNOLOGY_USERNAME` - Synology NAS username
-- `SYNOLOGY_PASSWORD` - Synology NAS password
+## Устранение неполадок
 
-### Optional Variables
+**Бот не отвечает**
+- Проверьте `TELEGRAM_BOT_TOKEN`.
+- В webhook-режиме убедитесь, что `WEBHOOK_URL` доступен извне и порт `8000`
+  проброшен.
+- Посмотрите логи — бот пишет в DEBUG довольно подробно.
 
-- `WEBHOOK_URL` - Webhook URL for production deployment
-- `RUTRACKER_PROXY` - HTTP proxy for RuTracker (if needed)
-- `RUTRACKER_USER_AGENT` - Custom User-Agent string
-- `ALLOWED_USER_IDS` - Comma-separated list of allowed Telegram user IDs (empty = all users)
-- `SYNOLOGY_USE_HTTPS` - Use HTTPS for Synology API (default: False)
-- `SYNOLOGY_PORT` - Synology NAS port (default: 5000)
+**Inline не показывает результаты**
+- Проверьте, что inline-режим включён у бота в BotFather.
+- Запрос должен быть не короче 2 символов.
+- Kinopub может временно быть недоступен — попробуйте позже.
 
-## Features in Detail
+**Поиск на RuTracker не работает / возвращает HTML**
+- Проверьте `RUTRACKER_LOGIN` / `RUTRACKER_PASSWORD`.
+- В некоторых регионах RuTracker заблокирован — пропишите `RUTRACKER_PROXY`.
+- Если в логах видно «Получена HTML-страница вместо торрент-файла», скорее
+  всего истекла сессия; клиент попробует перелогиниться автоматически, но
+  проверьте логин и пароль.
 
-### Torrent Filtering
+**Раздача не ставится в Download Station**
+- Проверьте, что пользователь Synology имеет права на Download Station и на
+  целевую папку.
+- Проверьте, что папки из `DOWNLOAD_STATION_FOLDER_*` существуют на NAS.
+- Если в логах коды `101`/`402`/`403`/`406`, бот автоматически повторит
+  запрос без указания `destination` — это fallback, и раздача попадёт в
+  папку по умолчанию DSM.
 
-The bot uses intelligent filtering to show only the best quality torrents:
+## Лицензия
 
-- **Resolution Priority**: Prefers 2160p > 1080p
-- **HDR/DV Support**: Identifies and marks HDR/Dolby Vision releases
-- **Quality Indicators**: Filters by common quality markers
-- **Content Matching**: Ensures torrent matches the searched content
-
-### Download Monitoring
-
-- Checks download status every minute
-- Sends completion notification when download finishes
-- Handles errors and notifies user
-- Automatically stops monitoring when task completes or fails
-
-### Access Control
-
-If `ALLOWED_USER_IDS` is set, only specified users can interact with the bot. Other users receive an access denied message.
-
-## Troubleshooting
-
-### Bot not responding
-
-- Check that `TELEGRAM_BOT_TOKEN` is correct
-- Verify bot is running (check logs)
-- For webhook mode, ensure `WEBHOOK_URL` is accessible
-
-### Downloads not starting
-
-- Verify Synology NAS credentials
-- Check that Download Station is running
-- Ensure download folders exist on NAS
-- Check network connectivity to NAS
-
-### Search not working
-
-- Verify RuTracker credentials
-- Check if proxy is needed (some regions require proxy)
-- Ensure internet connectivity
-
-## License
-
-This project is open source and available under the MIT License.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Support
-
-If you encounter any issues or have questions, please open an issue on [GitHub](https://github.com/tltroll/rutracker-to-synology/issues).
-
+MIT.
